@@ -214,11 +214,11 @@ canvas {
       <canvas id="cv-fft"></canvas>
     </div>
     <div class="plot-container">
-      <div class="plot-title">Harmonic sum A — AMPLITUDES: Σ(|X|−base)/(rms·√m) at folds 1,2,3,4,6,8,12,16 — best in green</div>
+      <div class="plot-title">Harmonic sum A — AMPLITUDES: Σ(|X|−base)/(rms·√m) at folds 1,2,3,4,6,8,12,16,24,32 — best in green</div>
       <canvas id="cv-sn"></canvas>
     </div>
     <div class="plot-container">
-      <div class="plot-title">Harmonic sum B — POWERS (χ²): equivalent σ of Σ|X|²/⟨P<sub>noise</sub>⟩ at folds 1,2,3,4,6,8,12,16 — best in green</div>
+      <div class="plot-title">Harmonic sum B — POWERS (χ²): equivalent σ of Σ|X|²/⟨P<sub>noise</sub>⟩ at folds 1,2,3,4,6,8,12,16,24,32 — best in green</div>
       <canvas id="cv-sn2"></canvas>
     </div>
   </div>
@@ -617,8 +617,8 @@ function drawFoldScatter(canvas, folds, sns, color) {
   const ml = 46, mr = 12, mt = 10, mb = 32, pw = W - ml - mr, ph = H - mt - mb;
   ctx.fillStyle = '#0d1117'; ctx.fillRect(0, 0, W, H);
   if (!folds.length) return;
-  const FSET = [1, 2, 3, 4, 6, 8, 12, 16];
-  const fmax = Math.max(16, Math.max.apply(null, folds));
+  const FSET = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32];
+  const fmax = Math.max(32, Math.max.apply(null, folds));
   let ylo = Math.min.apply(null, sns), yhi = Math.max.apply(null, sns);
   ylo = Math.min(0, ylo); if (ylo === yhi) yhi = ylo + 1; yhi += (yhi - ylo) * 0.08;
   const xlo = 0.5, xhi = fmax + 0.5;
@@ -707,7 +707,7 @@ function update(collectOnly) {
 
   // --- Harmonics of the fundamental (bin may be non-integer -> nearest-bin peak search) ---
   const f0_bin = totalSamp / Lf;                     // fundamental bin index (= fftDur / P)
-  const N_HARM = 16;
+  const N_HARM = 32;
   const nHarmonics = Math.max(0, Math.min(N_HARM, Math.floor((nFreq - 1) / Math.max(f0_bin, 1e-9))));
   const expectedHarm = Math.ceil(1 / duty);
   const harmonicBins = [];
@@ -809,8 +809,8 @@ function update(collectOnly) {
   // --- Expected radiometer S/N ---
   const radioSN = (Smean / 1000) / SEFD * Math.sqrt(N_POL * bw * 1e6 * tObsEff) * Math.sqrt((1 - duty) / duty);
 
-  // Best fold within the standard set {1,2,3,4,6,8,12,16} for each method
-  const FOLD_SET = [1, 2, 3, 4, 6, 8, 12, 16].filter(f => f <= nHarmonics);
+  // Best fold within the standard set {1,2,3,4,6,8,12,16,24,32} for each method
+  const FOLD_SET = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32].filter(f => f <= nHarmonics);
   const aVals = FOLD_SET.map(f => sumSN[f - 1]);
   const bVals = FOLD_SET.map(f => powSN[f - 1]);
   const aBest = FOLD_SET.length ? aVals.indexOf(Math.max.apply(null, aVals)) : -1;
@@ -899,7 +899,7 @@ function update(collectOnly) {
   html += `<strong>Folded-profile S/N:</strong> best boxcar = <strong style="color:#3fb950">${foldSN.toFixed(1)}</strong> (width searched → W=${bestW} bins ≈ ${(100*bestW/N_PHASE).toFixed(1)}% of period; edges in pink) · matched-filter = ${foldMatchSN.toFixed(1)}<br>`;
   const aTxt = FOLD_SET.length ? `${FOLD_SET[aBest]} harmonics → ${aVals[aBest].toFixed(1)}` : 'n/a';
   const bTxt = FOLD_SET.length ? `${FOLD_SET[bBest]} harmonics → ${bVals[bBest].toFixed(1)}` : 'n/a';
-  html += `<strong>FFT harmonic sum</strong> (best fold of 1,2,3,4,6,8,12,16): A amplitudes ${aTxt}   |   B powers(χ²) <strong style="color:#39c5cf">${bTxt}</strong>   (≈${expectedHarm} significant harmonics = 1/δ; both should sit ≤ the fold)<br><br>`;
+  html += `<strong>FFT harmonic sum</strong> (best fold of 1,2,3,4,6,8,12,16,24,32): A amplitudes ${aTxt}   |   B powers(χ²) <strong style="color:#39c5cf">${bTxt}</strong>   (≈${expectedHarm} significant harmonics = 1/δ; both should sit ≤ the fold)<br><br>`;
   html += '<table style="font-size:0.8rem;border-collapse:collapse">';
   html += '<tr style="color:#58a6ff">'
         + '<td style="padding:2px 10px">Harmonic</td>'
