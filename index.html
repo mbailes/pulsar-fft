@@ -814,7 +814,8 @@ function update(collectOnly) {
   const Asum = new Float64Array(nFreq), Psum = new Float64Array(nFreq);
   for (let f = 1; f < nFreq; f++) { Asum[f] = zA[f]; Psum[f] = zP[f]; }
   let jDone = 1;
-  let foundFbin = 1, foundSig = -Infinity;              // fundamental bin of the best χ² candidate
+  let foundFbin = 1, foundSig = -Infinity;              // fundamental bin of the best χ² (method B) candidate
+  let foundFbinA = 1, foundValA = -Infinity;            // fundamental bin of the best amplitude (method A) candidate
   for (const m of FOLD_SET) {
     for (let j = jDone + 1; j <= m; j++) {           // fold in harmonics up to m
       const fm = Math.floor((nFreq - 1) / j);
@@ -822,12 +823,13 @@ function update(collectOnly) {
     }
     jDone = m;
     const fm = Math.floor((nFreq - 1) / m);
-    let mA = -Infinity, mB = -Infinity, mBf = 1;      // brightest candidate over all trial f
-    for (let f = 1; f <= fm; f++) { if (Asum[f] > mA) mA = Asum[f]; if (Psum[f] > mB) { mB = Psum[f]; mBf = f; } }
-    const bSig = sigmaFromChi2(m, mB);
-    aVals.push(mA / Math.sqrt(m));                            // naive amplitude z-sum (skewed → inflates)
+    let mA = -Infinity, mAf = 1, mB = -Infinity, mBf = 1;      // brightest candidate over all trial f
+    for (let f = 1; f <= fm; f++) { if (Asum[f] > mA) { mA = Asum[f]; mAf = f; } if (Psum[f] > mB) { mB = Psum[f]; mBf = f; } }
+    const bSig = sigmaFromChi2(m, mB), aScore = mA / Math.sqrt(m);
+    aVals.push(aScore);                                       // naive amplitude z-sum (skewed → inflates)
     bVals.push(bSig);                                          // χ² equivalent-σ significance (realistic)
     if (bSig > foundSig) { foundSig = bSig; foundFbin = mBf; }
+    if (aScore > foundValA) { foundValA = aScore; foundFbinA = mAf; }
   }
   const aBest = FOLD_SET.length ? aVals.indexOf(Math.max.apply(null, aVals)) : -1;
   const bBest = FOLD_SET.length ? bVals.indexOf(Math.max.apply(null, bVals)) : -1;
@@ -942,8 +944,14 @@ function update(collectOnly) {
   // --- Expected radiometer S/N ---
   const radioSN = (Smean / 1000) / SEFD * Math.sqrt(N_POL * bw * 1e6 * tObsEff) * Math.sqrt((1 - duty) / duty);
 
-  // Headless trial mode: return just the metrics, skip all drawing.
-  if (collectOnly) return { foldSN, snA, snB, aFold, bFold };
+  // Headless trial mode: return the metrics, skip all drawing. Extra fields (period recovery,
+  // detection state) are ignored by the in-app trials histogram but let external tests check
+  // period accuracy, alias rate, and detection behaviour against the injected signal.
+  if (collectOnly) return { foldSN, snA, snB, aFold, bFold,
+    refinedPeriod, foundPeriod, foundFbin, bestDelta, detected, radioSN, nomSN,
+    truePeriod: P, periodRatio: refinedPeriod / P,
+    // #1-candidate period from each harmonic-summing method (nominal, before pdmp) for classification
+    candPeriodA: totalSamp / Math.max(foundFbinA, 1) * tSamp, candPeriodB: foundPeriod };
 
   // === Draw plots ===
 
@@ -962,6 +970,7 @@ function update(collectOnly) {
   // When nothing crosses the detection threshold, still report the strongest candidate the blind
   // search turned up (its χ² S/N and the period it sits at) so the near-miss is visible.
   const profAnn = detected ? [
+    { text: `S/N = ${foldSN.toFixed(1)}σ`, color: '#3fb950' },
     { text: `P = ${pFoundMs.toFixed(4)} ms`, color: '#3fb950' },
     { text: `P/P₀ = ${pRatio.toFixed(4)}`, color: Math.abs(pRatio - 1) < 0.02 ? '#3fb950' : '#f0883e' },
     { text: `W = ${wFoundMs.toFixed(3)} ms (${(100*bestW/N_PHASE).toFixed(1)}%)`, color: '#f778ba' },
@@ -1076,9 +1085,21 @@ btnRegen.addEventListener('click', () => update());
 async function runTrials(n) {
   btnTrials.disabled = true; btnRegen.disabled = true;
   const fold = [], A = [], B = [], aF = [], bF = [];
+  // Per-method tally of the #1 candidate's period vs the injected pulsar:
+  //   right = the true fundamental; harmonic = a 1/4…4× alias; wrong = anything else (noise bin).
+  const tA = { right: 0, harm: 0, wrong: 0 }, tB = { right: 0, harm: 0, wrong: 0 };
+  const HARMS = [2, 3, 4, 1/2, 1/3, 1/4];
+  const classify = (candP, trueP, t) => {
+    const r = candP / trueP;
+    if (Math.abs(r - 1) < 0.02) t.right++;
+    else if (HARMS.some(k => Math.abs(r - k) < 0.02 * k)) t.harm++;
+    else t.wrong++;
+  };
   for (let t = 0; t < n; t++) {
     const r = update(true);
     fold.push(r.foldSN); A.push(r.snA); B.push(r.snB); aF.push(r.aFold); bF.push(r.bFold);
+    classify(r.candPeriodA, r.truePeriod, tA);    // method A — amplitude harmonic sum
+    classify(r.candPeriodB, r.truePeriod, tB);    // method B — χ² power harmonic sum (drives the fold)
     if (t % 5 === 4) { trialStatus.textContent = `running… ${t + 1}/${n}`; await new Promise(res => setTimeout(res, 0)); }
   }
   drawHistogram(cvH1, fold, '#3fb950', 'Folded S/N');
@@ -1088,7 +1109,14 @@ async function runTrials(n) {
   drawFoldScatter(cvFA, aF, A, '#d2a8ff');
   drawFoldScatter(cvFB, bF, B, '#39c5cf');
   const mean = a => a.reduce((x, y) => x + y, 0) / a.length;
-  trialStatus.textContent = `${n} trials · means: fold ${mean(fold).toFixed(1)}, naive ${mean(A).toFixed(1)}, better ${mean(B).toFixed(1)}`;
+  const row = (label, t) => `${label}: `
+    + `<span style="color:#3fb950">right ${t.right}</span> · `
+    + `<span style="color:#f0883e">harmonic ${t.harm}</span> · `
+    + `<span style="color:#8b949e">wrong ${t.wrong}</span>`;
+  trialStatus.innerHTML = `${n} trials · mean S/N: fold ${mean(fold).toFixed(1)}, ampl ${mean(A).toFixed(1)}, χ² ${mean(B).toFixed(1)}`
+    + `<br><strong>#1 candidate period vs true pulsar (out of ${n}):</strong>`
+    + `<br>&nbsp;&nbsp;A — amplitude sum &nbsp; ${row('', tA)}`
+    + `<br>&nbsp;&nbsp;B — χ² power sum &nbsp;&nbsp; ${row('', tB)}`;
   btnTrials.disabled = false; btnRegen.disabled = false;
   update();   // restore the live single-trial display
 }
