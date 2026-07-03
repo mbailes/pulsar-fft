@@ -959,11 +959,17 @@ function update(collectOnly) {
   const pFoundMs = refinedPeriod * 1000;
   const wFoundMs = bestW / N_PHASE * refinedPeriod * 1000;
   const pRatio = refinedPeriod / P;                                  // discovered : injected
+  // When nothing crosses the detection threshold, still report the strongest candidate the blind
+  // search turned up (its χ² S/N and the period it sits at) so the near-miss is visible.
   const profAnn = detected ? [
     { text: `P = ${pFoundMs.toFixed(4)} ms`, color: '#3fb950' },
     { text: `P/P₀ = ${pRatio.toFixed(4)}`, color: Math.abs(pRatio - 1) < 0.02 ? '#3fb950' : '#f0883e' },
     { text: `W = ${wFoundMs.toFixed(3)} ms (${(100*bestW/N_PHASE).toFixed(1)}%)`, color: '#f778ba' },
-  ] : [{ text: 'no significant pulse detected', color: '#8b949e' }];
+  ] : [
+    { text: `no significant pulse (< ${DETECT_MIN}σ)`, color: '#8b949e' },
+    { text: `best S/N = ${snB.toFixed(1)}σ`, color: '#8b949e' },
+    { text: `at P = ${(foundPeriod * 1000).toFixed(4)} ms`, color: '#8b949e' },
+  ];
   drawPlot(cvPulse, {
     data: foldShift,
     markers: [boxL, boxR], markerColor: '#f778ba',
