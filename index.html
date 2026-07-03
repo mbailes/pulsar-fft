@@ -899,16 +899,30 @@ function update(collectOnly) {
     return { sn, base: bs, orms, peak: pk, bw, start: st0 };
   }
 
+  // The δ-scan optimises a single SMOOTH, width-free statistic: the baseline-subtracted sum of
+  // squares of the co-added profile ("sharpness"). It peaks exactly when the subints align (the
+  // pulse is tallest / narrowest), falls off smoothly either side, and — crucially — has NO boxcar-
+  // width search and NO off-pulse rms inside the loop. (The old metric re-fit the width over 64
+  // trials AND re-estimated the rms at every δ; both injected noise into the landscape, so the
+  // argmax wandered off the true period — e.g. a 10.000 ms pulsar "refining" to 9.9997 ms.)
+  const sharpness = prof => {
+    const srt = Array.prototype.slice.call(prof).sort((a, b) => a - b);
+    const base = srt[N_PHASE >> 1];                       // robust (median) baseline
+    let v = 0; for (let b = 0; b < N_PHASE; b++) { const d = prof[b] - base; v += d * d; }
+    return v;
+  };
   // δ = 0 folds the whole span at the nominal period (no refinement). Search a grid around it;
   // one δ bin of error = one full turn of phase drift across the observation, so ±1.2 bins covers it.
   const nomStat = profStats(foldTrial(0));
-  let bestDelta = 0, bestStat = nomStat;
+  let bestDelta = 0, bestScore = sharpness(foldTrial(0));
   const DMAX = 1.2, DSTEP = collectOnly ? 0.02 : 0.008;
   for (let d = -DMAX; d <= DMAX + 1e-9; d += DSTEP) {
     if (Math.abs(d) < DSTEP / 2) continue;
-    const st = profStats(foldTrial(d));
-    if (st.sn > bestStat.sn) { bestStat = st; bestDelta = d; }
+    const sc = sharpness(foldTrial(d));
+    if (sc > bestScore) { bestScore = sc; bestDelta = d; }
   }
+  // Fit the boxcar width/phase and off-pulse rms ONCE, at the chosen period (for display + S/N).
+  let bestStat = profStats(foldTrial(bestDelta));
   // A period refinement fit to noise is meaningless (random δ → a spurious slanted track). Refine
   // ONLY when the blind FFT search actually detected something (snB above the look-elsewhere floor)
   // AND the folded pulse is significant; otherwise keep the nominal period so the track stays flat.
