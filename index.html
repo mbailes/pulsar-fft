@@ -162,12 +162,9 @@ canvas {
       <input type="range" id="sl-duty" min="0.5" max="50" step="0.5" value="5">
     </div>
     <div class="control-group">
-      <label>Observation length</label>
-      <span class="value" id="v-tobs">10 s</span>
-      <input type="range" id="sl-tobs" min="1" max="300" step="0.001" value="10">
-      <label style="font-weight:400;display:flex;gap:5px;align-items:center;margin-top:4px">
-        <input type="checkbox" id="cb-pow2" style="accent-color:#58a6ff"> truncate to 2<sup>N</sup> samples
-      </label>
+      <label>Observation length &nbsp;=&nbsp; 2<sup>N</sup> samples</label>
+      <span class="value" id="v-nexp">2¹⁸ = 262144 samp · 16.8 s</span>
+      <input type="range" id="sl-nexp" min="8" max="20" step="1" value="18">
     </div>
     <div class="control-group">
       <label>Flux density S<sub>mean</sub></label>
@@ -200,10 +197,20 @@ canvas {
     </div>
   </div>
 
+  <div class="presets" style="margin:0 0 14px; align-items:center">
+    <button id="btn-regen">🎲 Regenerate (new noise)</button>
+    <button id="btn-trials">Run 100 trials</button>
+    <span id="trial-status" style="color:#8b949e; margin-left:6px"></span>
+  </div>
+
   <div class="canvas-row">
     <div class="plot-container">
-      <div class="plot-title">Folded profile (data green, template orange) — best-boxcar edges in pink</div>
+      <div class="plot-title">Sharpened folded profile (pdmp best period, data green) — best-boxcar edges in pink</div>
       <canvas id="cv-pulse"></canvas>
+    </div>
+    <div class="plot-container">
+      <div class="plot-title">Subintegrations — phase (x) vs time (y), folded at NOMINAL period; pink = drifting boxcar edges (pulse drifts between them; pdmp straightens it)</div>
+      <canvas id="cv-subs"></canvas>
     </div>
     <div class="plot-container">
       <div class="plot-title">Time Series (raw, showing multiple pulses + noise)</div>
@@ -214,11 +221,11 @@ canvas {
       <canvas id="cv-fft"></canvas>
     </div>
     <div class="plot-container">
-      <div class="plot-title">Harmonic sum A — AMPLITUDES: Σ(|X|−base)/(rms·√m) at folds 1,2,3,4,6,8,12,16,24,32 — best in green</div>
+      <div class="plot-title">Blind search A — AMPLITUDE sum (naive, mis-calibrated → reads high; for contrast only): brightest candidate over all trial freqs, folds 1,2,3,4,6,8,12,16,24,32 — best in green</div>
       <canvas id="cv-sn"></canvas>
     </div>
     <div class="plot-container">
-      <div class="plot-title">Harmonic sum B — POWERS (χ²): equivalent σ of Σ|X|²/⟨P<sub>noise</sub>⟩ at folds 1,2,3,4,6,8,12,16,24,32 — best in green</div>
+      <div class="plot-title">Blind search B — POWERS (χ²) — THE realistic FFT S/N (what real codes use): brightest candidate σ over all trial freqs, folds 1,2,3,4,6,8,12,16,24,32 — best in green</div>
       <canvas id="cv-sn2"></canvas>
     </div>
   </div>
@@ -245,11 +252,6 @@ canvas {
   </div>
 
   <div style="margin-top:22px">
-    <div class="presets" style="margin-bottom:12px; align-items:center">
-      <button id="btn-regen">🎲 Regenerate (new noise)</button>
-      <button id="btn-trials">Run 100 trials</button>
-      <span id="trial-status" style="color:#8b949e; margin-left:6px"></span>
-    </div>
     <div style="display:flex; gap:14px; flex-wrap:wrap">
       <div class="plot-container" style="flex:1; min-width:230px">
         <div class="plot-title">Folded S/N (best boxcar)</div><canvas id="cv-h1"></canvas>
@@ -286,16 +288,16 @@ const N_PHASE = 128;      // phase bins in the fold
 // Get elements
 const ctrl = {
   tsamp: ['sl-tsamp', 'v-tsamp'], period: ['sl-period', 'v-period'],
-  duty:  ['sl-duty',  'v-duty'],  tobs:   ['sl-tobs',   'v-tobs'],
+  duty:  ['sl-duty',  'v-duty'],  nexp:   ['sl-nexp',   'v-nexp'],
   flux:  ['sl-flux',  'v-flux'],  bw:     ['sl-bw',     'v-bw'],
   gain:  ['sl-gain',  'v-gain'],  tsys:   ['sl-tsys',   'v-tsys'],
 };
 const sl = {}, vv = {};
 for (const k in ctrl) { sl[k] = document.getElementById(ctrl[k][0]); vv[k] = document.getElementById(ctrl[k][1]); }
-const cbPow2 = document.getElementById('cb-pow2');
 const cvPulse = document.getElementById('cv-pulse');
 const cvTime = document.getElementById('cv-time');
 const cvFft = document.getElementById('cv-fft');
+const cvSubs = document.getElementById('cv-subs');
 const cvSn = document.getElementById('cv-sn');
 const cvSn2 = document.getElementById('cv-sn2');
 const harmonicInfo = document.getElementById('harmonic-info');
@@ -306,7 +308,13 @@ const btnRegen = document.getElementById('btn-regen'), btnTrials = document.getE
 const trialStatus = document.getElementById('trial-status');
 
 function setPreset(p) {
-  for (const k in p) if (sl[k]) sl[k].value = p[k];
+  const q = Object.assign({}, p);
+  if (q.tobs != null) {                              // convert requested seconds → nearest 2^N samples
+    const tsampUs = Math.pow(2, q.tsamp != null ? q.tsamp : parseInt(sl.tsamp.value));
+    q.nexp = Math.min(20, Math.max(8, Math.round(Math.log2(q.tobs / (tsampUs * 1e-6)))));
+    delete q.tobs;
+  }
+  for (const k in q) if (sl[k]) sl[k].value = q[k];
   update();
 }
 
@@ -405,7 +413,7 @@ function drawPlot(canvas, opts) {
   ctx.scale(pr, pr);
 
   const { data, xLabel, yLabel, color, markers, markerColor, xMin, xMax, yMin, yMax,
-          filled, secondData, secondColor, envelope, bars, cats, barBest } = opts;
+          filled, secondData, secondColor, envelope, bars, cats, barBest, annotations } = opts;
 
   const ml = 60, mr = 16, mt = 10, mb = 32;
   const pw = W - ml - mr, ph = H - mt - mb;
@@ -558,6 +566,60 @@ function drawPlot(canvas, opts) {
   ctx.textAlign = 'center';
   if (yLabel) ctx.fillText(yLabel, 0, 0);
   ctx.restore();
+
+  // Optional in-plot annotations (e.g. found period & width), stacked in the top-right corner.
+  if (annotations && annotations.length) {
+    ctx.textAlign = 'right';
+    ctx.font = '12px -apple-system, sans-serif';
+    let ay = mt + 14;
+    for (const a of annotations) {
+      ctx.fillStyle = a.color || '#3fb950';
+      ctx.fillText(a.text, ml + pw - 6, ay);
+      ay += 15;
+    }
+  }
+}
+
+// Greyscale waterfall of the subintegration profiles (phase × time), rolled so the pulse is
+// centred. `lines` is an array of {xOf:(s)=>phaseBin, color} drift tracks — here the two boxcar
+// edges, so the drifting pulse lies BETWEEN them (what the pdmp trial-period search flattens).
+function drawSubints(canvas, subProf, nsub, nph, roll, lines) {
+  const pr = window.devicePixelRatio || 1;
+  const W = canvas.clientWidth, H = canvas.clientHeight;
+  canvas.width = W * pr; canvas.height = H * pr;
+  const ctx = canvas.getContext('2d'); ctx.scale(pr, pr);
+  const ml = 44, mr = 12, mt = 10, mb = 32;
+  const pw = W - ml - mr, ph = H - mt - mb;
+  ctx.fillStyle = '#0d1117'; ctx.fillRect(0, 0, W, H);
+  let lo = Infinity, hi = -Infinity;
+  for (let k = 0; k < nsub * nph; k++) { const v = subProf[k]; if (v < lo) lo = v; if (v > hi) hi = v; }
+  const rng = (hi - lo) || 1;
+  const cw = pw / nph, chh = ph / nsub;
+  for (let s = 0; s < nsub; s++) {
+    for (let c = 0; c < nph; c++) {
+      const v = subProf[s * nph + ((c + roll) % nph)];
+      const g = Math.max(0, Math.min(255, Math.round((v - lo) / rng * 255)));
+      ctx.fillStyle = `rgb(${g},${g},${g})`;
+      ctx.fillRect(ml + c * cw, mt + s * chh, cw + 0.6, chh + 0.6);
+    }
+  }
+  ctx.lineWidth = 1.5;
+  for (const ln of lines) {
+    ctx.strokeStyle = ln.color;
+    let prevX = null;
+    for (let s = 0; s < nsub; s++) {
+      let x = ln.xOf(s); x = ((x % nph) + nph) % nph;
+      const px = ml + (x + 0.5) * cw, py = mt + (s + 0.5) * chh;
+      if (prevX !== null && Math.abs(x - prevX) < nph / 2) {
+        ctx.beginPath(); ctx.moveTo(ml + (prevX + 0.5) * cw, mt + (s - 0.5) * chh); ctx.lineTo(px, py); ctx.stroke();
+      }
+      prevX = x;
+    }
+  }
+  ctx.fillStyle = '#8b949e'; ctx.font = '11px sans-serif'; ctx.textAlign = 'center';
+  ctx.fillText('Phase bin', ml + pw / 2, H - 8);
+  ctx.save(); ctx.translate(13, mt + ph / 2); ctx.rotate(-Math.PI / 2); ctx.fillText('Subint (time →)', 0, 0); ctx.restore();
+  ctx.strokeStyle = '#30363d'; ctx.lineWidth = 1; ctx.strokeRect(ml, mt, pw, ph);
 }
 
 function drawHistogram(canvas, values, color, xlabel) {
@@ -645,7 +707,7 @@ function update(collectOnly) {
   const tSampUs = Math.pow(2, tsampExp);           // microseconds
   const period = parseFloat(sl.period.value);      // ms
   const duty = parseFloat(sl.duty.value) / 100;    // fraction
-  const tObs = parseFloat(sl.tobs.value);          // s
+  const log2N = Math.min(MAX_LOG2, Math.max(6, parseInt(sl.nexp.value)));  // observation = 2^N samples
   const Smean = parseFloat(sl.flux.value);         // mJy (period-averaged flux density)
   const bw = parseFloat(sl.bw.value);              // MHz
   const gain = parseFloat(sl.gain.value);          // K/Jy
@@ -654,27 +716,28 @@ function update(collectOnly) {
   vv.tsamp.textContent = tSampUs + ' µs';
   vv.period.textContent = period.toFixed(1) + ' ms';
   vv.duty.textContent = (duty * 100).toFixed(1) + '%';
-  vv.tobs.textContent = tObs.toFixed(2) + ' s';
   vv.flux.textContent = Smean.toFixed(2) + ' mJy';
   vv.bw.textContent = bw.toFixed(0) + ' MHz';
   vv.gain.textContent = gain.toFixed(2) + ' K/Jy';
   vv.tsys.textContent = tsys.toFixed(0) + ' K';
 
-  // --- Timing ---
+  // --- Timing ---  the observation is exactly 2^N REAL samples (every one is folded). The data are
+  //     then zero-padded up to a longer FFT — "interbinning" — so the spectrum is oversampled and
+  //     extra bins fall BETWEEN the natural ones. Without it, a signal whose true period lands mid-bin
+  //     is suppressed by scalloping (worst case −3.9 dB); that suppression guts the fundamental and
+  //     makes the harmonic search alias to 2f/4f (→ half/quarter the true period). 4× padding recovers
+  //     the worst-case fundamental to 97%, killing the alias. Real search codes interbin for this. ---
   const tSamp = tSampUs * 1e-6;                     // s
   const P = period * 1e-3;                          // s
   const Lf = P / tSamp;                             // samples per period (may be non-integer)
-  const nWanted = Math.max(2, Math.floor(tObs / tSamp));
-  // FFT length: either TRUNCATE the observation down to the largest 2^N <= requested samples
-  // (no padding, exact power-of-2 FFT), or use the NEXT 2^N with the observation zero-padded.
-  const truncate2N = cbPow2.checked;
-  const rawLog2 = truncate2N ? Math.floor(Math.log2(nWanted)) : Math.ceil(Math.log2(nWanted));
-  const log2N = Math.min(MAX_LOG2, Math.max(6, rawLog2));
-  const totalSamp = Math.pow(2, log2N);             // FFT length (power of 2)
-  const nData = truncate2N ? totalSamp : Math.min(nWanted, totalSamp);  // real samples of observation
-  const tObsEff = nData * tSamp;                     // observation length actually simulated
-  const fftDur = totalSamp * tSamp;                  // duration spanned by the (zero-padded) FFT
+  const nData = Math.pow(2, log2N);                  // REAL observation samples (all used in the fold)
+  const padF = Math.min(4, Math.pow(2, MAX_LOG2 - log2N)); // zero-pad factor, capped so FFT ≤ 2^MAX_LOG2
+  const totalSamp = nData * padF;                    // FFT length (power of 2); = nData when padF=1
+  const tObsEff = nData * tSamp;                     // real observation length (radiometer / pulse count)
+  const fftDur = totalSamp * tSamp;                  // duration spanned by the zero-padded FFT (bin→Hz)
   const nPulses = tObsEff / P;
+  const sup = n => String(n).replace(/[0-9]/g, d => '⁰¹²³⁴⁵⁶⁷⁸⁹'[d]);
+  vv.nexp.textContent = `2${sup(log2N)} = ${nData.toLocaleString()} samp · ${tObsEff < 1 ? (tObsEff*1000).toFixed(1)+' ms' : tObsEff.toFixed(2)+' s'}${padF > 1 ? ` · ${padF}× interbin` : ''}`;
 
   // --- Radiometer noise per sample (mJy):  sigma = Tsys / (G * sqrt(n_pol * dnu * t_samp)) ---
   const SEFD = tsys / gain;                          // Jy
@@ -709,144 +772,200 @@ function update(collectOnly) {
   const f0_bin = totalSamp / Lf;                     // fundamental bin index (= fftDur / P)
   const N_HARM = 32;
   const nHarmonics = Math.max(0, Math.min(N_HARM, Math.floor((nFreq - 1) / Math.max(f0_bin, 1e-9))));
-  const expectedHarm = Math.ceil(1 / duty);
   const harmonicBins = [];
   for (let h = 1; h <= nHarmonics; h++) harmonicBins.push(Math.round(h * f0_bin));
 
-  // --- Baseline / rms / <P_noise> of the amplitude spectrum (exclude harmonics ±3 bins and DC) ---
-  const isHarm = new Uint8Array(nFreq);
-  for (const b of harmonicBins) for (let k = b - 3; k <= b + 3; k++) if (k >= 0 && k < nFreq) isHarm[k] = 1;
-  const dcCut = Math.max(1, Math.floor(Math.min(f0_bin, nFreq) / 2));
+  // --- Global noise stats of the FULL amplitude spectrum (used for the display panels only). ---
   let sum = 0, count = 0, sumP2 = 0;
-  for (let i = dcCut; i < nFreq; i++) if (!isHarm[i]) { sum += power[i]; sumP2 += power[i] * power[i]; count++; }
-  const baseline = sum / Math.max(count, 1);
-  const meanNoisePow = sumP2 / Math.max(count, 1);      // <P_noise> = mean |X|^2 over noise bins
+  for (let i = 1; i < nFreq; i++) { sum += power[i]; sumP2 += power[i] * power[i]; count++; }
+  const baseline = sum / Math.max(count, 1);            // mean |X|
+  const meanNoisePow = sumP2 / Math.max(count, 1);      // <|X|^2>
   let sq = 0;
-  for (let i = dcCut; i < nFreq; i++) if (!isHarm[i]) { const d = power[i] - baseline; sq += d * d; }
+  for (let i = 1; i < nFreq; i++) { const d = power[i] - baseline; sq += d * d; }
   const rms = Math.sqrt(sq / Math.max(count, 1)) || 1;
 
-  // --- Harmonic amplitudes by DIRECT DFT at the EXACT harmonic frequencies (no grid leakage
-  //     and no ±3-bin max-selection bias). All harmonics in one pass with rotating phasors. ---
-  const harmAmp = new Float64Array(nHarmonics);   // |X| at h*f0
-  const harmPow = new Float64Array(nHarmonics);   // |X|^2 at h*f0
+  // --- Local (running-median) normalisation = de-reddening, exactly as real search codes do.
+  //     Per-block MEDIAN of |X|² is a robust local noise level (median = mean·ln2 for exponential
+  //     noise, so localMeanPow = median/ln2). We then z-score each bin: the χ² method normalises
+  //     the power to Exp(1); the amplitude method standardises |X| with its Rayleigh mean/rms.
+  //     Flat for white noise, but tracks red noise / RFI so the harmonic sums stay calibrated. ---
+  const AMP_BASE = Math.sqrt(Math.PI) / 2;             // E[|X|] = √meanPow · √π/2   (Rayleigh)
+  const AMP_RMS  = Math.sqrt(1 - Math.PI / 4);         // σ|X|   = √meanPow · √(1−π/4)
+  const BLK = Math.max(64, Math.min(1024, nFreq >> 6)); // running-median block width
+  const zA = new Float64Array(nFreq);                  // standardised amplitude per bin  (mean 0, σ 1)
+  const zP = new Float64Array(nFreq);                  // normalised power per bin         (Exp(1))
+  const blkBuf = [];
+  for (let b0 = 1; b0 < nFreq; b0 += BLK) {
+    const b1 = Math.min(b0 + BLK, nFreq);
+    blkBuf.length = 0;
+    for (let i = b0; i < b1; i++) blkBuf.push(power[i] * power[i]);
+    blkBuf.sort((x, y) => x - y);
+    const med = blkBuf[blkBuf.length >> 1] || 1e-30;
+    const meanPow = med / Math.LN2, sp = Math.sqrt(meanPow);
+    for (let i = b0; i < b1; i++) { zA[i] = (power[i] - AMP_BASE * sp) / (AMP_RMS * sp); zP[i] = power[i] * power[i] / meanPow; }
+  }
+
+  // --- BLIND incoherent harmonic search: at EVERY trial fundamental bin f, accumulate the
+  //     locally-normalised amplitude / power at f, 2f, 3f, … and keep the BRIGHTEST candidate over
+  //     all f. The search does not know the period, so pure noise still yields a non-zero best
+  //     candidate — the look-elsewhere floor set by the number of trial frequencies. ---
+  const FOLD_SET = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32].filter(m => m < nFreq / 2);
+  const aVals = [], bVals = [];                         // brightest-candidate S/N per fold
+  const Asum = new Float64Array(nFreq), Psum = new Float64Array(nFreq);
+  for (let f = 1; f < nFreq; f++) { Asum[f] = zA[f]; Psum[f] = zP[f]; }
+  let jDone = 1;
+  let foundFbin = 1, foundSig = -Infinity;              // fundamental bin of the best χ² candidate
+  for (const m of FOLD_SET) {
+    for (let j = jDone + 1; j <= m; j++) {           // fold in harmonics up to m
+      const fm = Math.floor((nFreq - 1) / j);
+      for (let f = 1; f <= fm; f++) { const b = j * f; Asum[f] += zA[b]; Psum[f] += zP[b]; }
+    }
+    jDone = m;
+    const fm = Math.floor((nFreq - 1) / m);
+    let mA = -Infinity, mB = -Infinity, mBf = 1;      // brightest candidate over all trial f
+    for (let f = 1; f <= fm; f++) { if (Asum[f] > mA) mA = Asum[f]; if (Psum[f] > mB) { mB = Psum[f]; mBf = f; } }
+    const bSig = sigmaFromChi2(m, mB);
+    aVals.push(mA / Math.sqrt(m));                            // naive amplitude z-sum (skewed → inflates)
+    bVals.push(bSig);                                          // χ² equivalent-σ significance (realistic)
+    if (bSig > foundSig) { foundSig = bSig; foundFbin = mBf; }
+  }
+  const aBest = FOLD_SET.length ? aVals.indexOf(Math.max.apply(null, aVals)) : -1;
+  const bBest = FOLD_SET.length ? bVals.indexOf(Math.max.apply(null, bVals)) : -1;
+  const snA = aBest >= 0 ? aVals[aBest] : 0;   // FFT S/N, blind amplitude harmonic sum (best fold)
+  const snB = bBest >= 0 ? bVals[bBest] : 0;   // FFT S/N, blind χ² harmonic sum (best fold)
+  const aFold = aBest >= 0 ? FOLD_SET[aBest] : 0;
+  const bFold = bBest >= 0 ? FOLD_SET[bBest] : 0;
+
+  // Period FOUND by the blind search (fundamental of the best candidate). We fold at THIS period,
+  // not the true one — so an FFT bin error smears the fold exactly as in a real search.
+  const foundLf = totalSamp / Math.max(foundFbin, 1);   // samples per period at the found period
+  const foundPeriod = foundLf * tSamp;                   // s
+
+  // --- pdmp-style fold: split the observation into subintegrations, fold each at the nominal
+  //     period, then search trial periods around it and co-add the subints, maximising the folded
+  //     S/N. A bin-quantised / scalloped period lets the pulse drift in phase across the span and
+  //     smear; the trial-period search re-aligns every subint and SHARPENS the pulse (this is what
+  //     PSRCHIVE's pdmp does). Phase & width are still read from the data — no a-priori template. ---
+  const NSUB = Math.max(1, Math.min(32, Math.floor(nData / Math.max(4 * foundLf, 1))));
+  const subLen = Math.floor(nData / NSUB);
+  const subProf = new Float64Array(NSUB * N_PHASE);
+  const subCtr = new Float64Array(NSUB);                 // mean sample index of each subint
   {
-    const cw = new Float64Array(nHarmonics), sw = new Float64Array(nHarmonics);
-    const pr = new Float64Array(nHarmonics), pi = new Float64Array(nHarmonics);
-    const ar = new Float64Array(nHarmonics), ai = new Float64Array(nHarmonics);
-    for (let h = 0; h < nHarmonics; h++) { const d = -TAU * (h + 1) / Lf; cw[h] = Math.cos(d); sw[h] = Math.sin(d); pr[h] = 1; }
-    for (let i = 0; i < nData; i++) {
-      const x = timeSeries[i] - tsMean;
-      for (let h = 0; h < nHarmonics; h++) {
-        ar[h] += x * pr[h]; ai[h] += x * pi[h];
-        const npr = pr[h] * cw[h] - pi[h] * sw[h];
-        pi[h] = pr[h] * sw[h] + pi[h] * cw[h]; pr[h] = npr;
+    const cnt = new Uint32Array(NSUB * N_PHASE);
+    for (let s = 0; s < NSUB; s++) {
+      const i0 = s * subLen, i1 = (s === NSUB - 1) ? nData : (s + 1) * subLen;
+      for (let i = i0; i < i1; i++) {
+        let ph = i / foundLf; ph -= Math.floor(ph);
+        let b = Math.floor(ph * N_PHASE); if (b >= N_PHASE) b = N_PHASE - 1;
+        subProf[s * N_PHASE + b] += timeSeries[i]; cnt[s * N_PHASE + b]++;
+      }
+      for (let b = 0; b < N_PHASE; b++) { const c = cnt[s * N_PHASE + b]; if (c) subProf[s * N_PHASE + b] /= c; }
+      subCtr[s] = (i0 + i1 - 1) / 2;
+    }
+  }
+
+  // Co-add the subints for a trial period offset δ (bins): folding at bin foundFbin+δ instead of
+  // foundFbin drifts sample i in phase by i·δ/totalSamp cycles, so subint s shifts by subCtr·δ/… .
+  const _scratch = new Float64Array(N_PHASE);
+  function foldTrial(delta, out) {
+    const prof = out || _scratch;
+    for (let b = 0; b < N_PHASE; b++) prof[b] = 0;
+    for (let s = 0; s < NSUB; s++) {
+      const shift = subCtr[s] * delta / totalSamp * N_PHASE;          // this subint's phase shift (bins)
+      const base = s * N_PHASE;
+      for (let b = 0; b < N_PHASE; b++) {
+        let pos = b - shift; pos -= Math.floor(pos / N_PHASE) * N_PHASE;   // wrap into [0,N_PHASE)
+        const b0 = Math.floor(pos) % N_PHASE, fr = pos - Math.floor(pos), b1 = (b0 + 1) % N_PHASE;
+        prof[b] += subProf[base + b0] * (1 - fr) + subProf[base + b1] * fr;
       }
     }
-    for (let h = 0; h < nHarmonics; h++) { harmPow[h] = ar[h] * ar[h] + ai[h] * ai[h]; harmAmp[h] = Math.sqrt(harmPow[h]); }
+    return prof;
+  }
+  // Robust baseline / off-pulse rms + boxcar-width search (phase & width from the data).
+  function profStats(prof) {
+    const srt = Array.prototype.slice.call(prof).sort((a, b) => a - b);
+    const bs = srt[N_PHASE >> 1];
+    const dv = Array.from(prof, v => Math.abs(v - bs)).sort((a, b) => a - b);
+    const orms = (1.4826 * dv[N_PHASE >> 1]) || 1e-12;
+    let pk = 0, pv = -Infinity;
+    for (let b = 0; b < N_PHASE; b++) { const v = (prof[(b-1+N_PHASE)%N_PHASE] + prof[b] + prof[(b+1)%N_PHASE]) / 3; if (v > pv) { pv = v; pk = b; } }
+    let sn = -Infinity, bw = 1, st0 = pk;
+    for (let W = 1; W <= (N_PHASE >> 1); W++) {
+      const st = ((pk - (W >> 1)) % N_PHASE + N_PHASE) % N_PHASE;
+      let acc = 0; for (let k = 0; k < W; k++) acc += prof[(st + k) % N_PHASE] - bs;
+      const v = acc / (orms * Math.sqrt(W));
+      if (v > sn) { sn = v; bw = W; st0 = st; }
+    }
+    return { sn, base: bs, orms, peak: pk, bw, start: st0 };
   }
 
-  // Method A — sum of AMPLITUDES:  S/N(m) = Σ(|X_h|−baseline)/(rms·√m)  [Gaussian approx; Rayleigh
-  //            skew makes it run high for bright signals]
-  // Method B — sum of POWERS (χ²):  P_h = |X_h|²/<P_noise>; the equivalent Gaussian σ of Σ_1^m P_h
-  //            from the χ²_{2m} tail (the calibrated, PRESTO-style significance)
-  const harmSN = new Float64Array(nHarmonics);
-  const sumSN = new Float64Array(nHarmonics);      // method A (amplitude)
-  const powSN = new Float64Array(nHarmonics);      // method B (power / χ²)
-  let cumExcess = 0, cumPow = 0;
-  let bestM = 1, bestSN = -Infinity, bestMp = 1, bestSNp = -Infinity;
-  for (let h = 0; h < nHarmonics; h++) {
-    harmSN[h] = (harmAmp[h] - baseline) / rms;
-    cumExcess += harmAmp[h] - baseline;
-    sumSN[h] = cumExcess / (rms * Math.sqrt(h + 1));
-    if (sumSN[h] > bestSN) { bestSN = sumSN[h]; bestM = h + 1; }
-
-    cumPow += harmPow[h] / meanNoisePow;
-    powSN[h] = sigmaFromChi2(h + 1, cumPow);
-    if (powSN[h] > bestSNp) { bestSNp = powSN[h]; bestMp = h + 1; }
+  // δ = 0 folds the whole span at the nominal period (no refinement). Search a grid around it;
+  // one δ bin of error = one full turn of phase drift across the observation, so ±1.2 bins covers it.
+  const nomStat = profStats(foldTrial(0));
+  let bestDelta = 0, bestStat = nomStat;
+  const DMAX = 1.2, DSTEP = collectOnly ? 0.02 : 0.008;
+  for (let d = -DMAX; d <= DMAX + 1e-9; d += DSTEP) {
+    if (Math.abs(d) < DSTEP / 2) continue;
+    const st = profStats(foldTrial(d));
+    if (st.sn > bestStat.sn) { bestStat = st; bestDelta = d; }
   }
-
-  // --- Fold at the true period (phase binning handles a non-integer samples/period) ---
-  const foldSum = new Float64Array(N_PHASE), foldCnt = new Uint32Array(N_PHASE);
-  for (let i = 0; i < nData; i++) {
-    let ph = i / Lf; ph -= Math.floor(ph);
-    let b = Math.floor(ph * N_PHASE); if (b >= N_PHASE) b = N_PHASE - 1;
-    foldSum[b] += timeSeries[i]; foldCnt[b]++;
-  }
+  // A period refinement fit to noise is meaningless (random δ → a spurious slanted track). Refine
+  // ONLY when the blind FFT search actually detected something (snB above the look-elsewhere floor)
+  // AND the folded pulse is significant; otherwise keep the nominal period so the track stays flat.
+  const DETECT_MIN = 8, REFINE_MIN_SN = 6;
+  const detected = snB >= DETECT_MIN;
+  if (!detected || bestStat.sn < REFINE_MIN_SN) { bestDelta = 0; bestStat = nomStat; }
+  const refined = bestDelta !== 0;
   const folded = new Float64Array(N_PHASE);
-  for (let b = 0; b < N_PHASE; b++) folded[b] = foldCnt[b] ? foldSum[b] / foldCnt[b] : 0;
-
-  // --- Folded-profile S/N with the pulse width NOT known a priori. Robust baseline + off-pulse
-  //     rms from the median / MAD, then search a range of boxcar widths centred on the profile
-  //     peak and keep the best S/N = Σ(on-pulse flux)/(σ_off·√W). ---
-  const sortedF = Array.from(folded).sort((a, b) => a - b);
-  const baseF = sortedF[N_PHASE >> 1];                                        // median baseline
-  const devF = Array.from(folded, v => Math.abs(v - baseF)).sort((a, b) => a - b);
-  const offRms = (1.4826 * devF[N_PHASE >> 1]) || 1e-12;                      // MAD → noise rms
-
-  // pulse peak (lightly smoothed argmax)
-  let peakBin = 0, peakV = -Infinity;
-  for (let b = 0; b < N_PHASE; b++) {
-    const v = (folded[(b - 1 + N_PHASE) % N_PHASE] + folded[b] + folded[(b + 1) % N_PHASE]) / 3;
-    if (v > peakV) { peakV = v; peakBin = b; }
-  }
-
-  // try boxcar widths 1..N_PHASE/2 centred on the peak; keep the best S/N
-  const Wmax = Math.max(1, Math.floor(N_PHASE / 2));
-  let foldSN = -Infinity, bestW = 1, boxStart = peakBin;
-  for (let W = 1; W <= Wmax; W++) {
-    const start = ((peakBin - (W >> 1)) % N_PHASE + N_PHASE) % N_PHASE;
-    let s = 0; for (let k = 0; k < W; k++) s += folded[(start + k) % N_PHASE] - baseF;
-    const sn = s / (offRms * Math.sqrt(W));
-    if (sn > foldSN) { foldSN = sn; bestW = W; boxStart = start; }
-  }
-  const boxEnd = (boxStart + bestW) % N_PHASE;
-
-  // Matched-filter S/N (optimal *if* the shape were known) — reference ceiling
-  let mfNum = 0, tplSq = 0;
-  for (let b = 0; b < N_PHASE; b++) { const t = fluxAt((b + 0.5) / N_PHASE); mfNum += (folded[b] - baseF) * t; tplSq += t * t; }
-  const foldMatchSN = mfNum / ((offRms * Math.sqrt(tplSq)) || 1e-12);
+  foldTrial(bestDelta, folded);
+  const baseF = bestStat.base, offRms = bestStat.orms, peakBin = bestStat.peak;
+  const bestW = bestStat.bw, boxStart = bestStat.start, boxEnd = (boxStart + bestW) % N_PHASE;
+  const foldSN = bestStat.sn;                             // sharpened (best trial period) S/N
+  const nomSN = nomStat.sn;                               // S/N folding the whole span at nominal
+  const refinedLf = totalSamp / Math.max(foundFbin + bestDelta, 1e-9);
+  const refinedPeriod = refinedLf * tSamp;               // pdmp-refined period (s)
 
   // --- Expected radiometer S/N ---
   const radioSN = (Smean / 1000) / SEFD * Math.sqrt(N_POL * bw * 1e6 * tObsEff) * Math.sqrt((1 - duty) / duty);
 
-  // Best fold within the standard set {1,2,3,4,6,8,12,16,24,32} for each method
-  const FOLD_SET = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32].filter(f => f <= nHarmonics);
-  const aVals = FOLD_SET.map(f => sumSN[f - 1]);
-  const bVals = FOLD_SET.map(f => powSN[f - 1]);
-  const aBest = FOLD_SET.length ? aVals.indexOf(Math.max.apply(null, aVals)) : -1;
-  const bBest = FOLD_SET.length ? bVals.indexOf(Math.max.apply(null, bVals)) : -1;
-  const snA = aBest >= 0 ? aVals[aBest] : 0;   // FFT S/N, naive amplitude sum (best fold)
-  const snB = bBest >= 0 ? bVals[bBest] : 0;   // FFT S/N, χ² power sum (best fold)
-  const aFold = aBest >= 0 ? FOLD_SET[aBest] : 0;   // harmonic number where A peaks
-  const bFold = bBest >= 0 ? FOLD_SET[bBest] : 0;   // harmonic number where B peaks
-
   // Headless trial mode: return just the metrics, skip all drawing.
   if (collectOnly) return { foldSN, snA, snB, aFold, bFold };
 
-  // In truncate-2^N mode, snap the observation-length slider to the exact 2^N-sample duration
-  // (the largest power of 2 that fits) so what you see on the slider is what is FFT'd AND folded.
-  if (truncate2N) {
-    const snapped = Math.min(300, Math.max(1, Math.ceil(tObsEff * 1000) / 1000));  // ≥ tObsEff, clamp to slider range
-    if (Math.abs(parseFloat(sl.tobs.value) - snapped) > 5e-4) sl.tobs.value = snapped;
-    vv.tobs.textContent = `${tObsEff.toFixed(3)} s (2^${log2N})`;
-  }
-
   // === Draw plots ===
 
-  // 1. Folded profile (data, green) vs clean template (orange), centred on the pulse
+  // 1. Folded profile (data, green), rolled so the found peak sits mid-panel. No template overlay —
+  //    the search knows neither phase nor width a priori; the pink lines are the best-boxcar edges.
   const halfP = Math.floor(N_PHASE / 2);
-  const foldShift = new Float64Array(N_PHASE), tmplShift = new Float64Array(N_PHASE);
-  for (let i = 0; i < N_PHASE; i++) {
-    foldShift[i] = folded[(i + halfP) % N_PHASE];
-    tmplShift[i] = fluxAt((((i + halfP) % N_PHASE) + 0.5) / N_PHASE);
-  }
-  const boxL = ((boxStart - halfP) % N_PHASE + N_PHASE) % N_PHASE;   // best-boxcar edges in shifted coords
-  const boxR = ((boxEnd - halfP) % N_PHASE + N_PHASE) % N_PHASE;
+  const roll = ((peakBin - halfP) % N_PHASE + N_PHASE) % N_PHASE;    // shift found peak to centre
+  const foldShift = new Float64Array(N_PHASE);
+  for (let i = 0; i < N_PHASE; i++) foldShift[i] = folded[(i + roll) % N_PHASE];
+  const boxL = ((boxStart - roll) % N_PHASE + N_PHASE) % N_PHASE;    // best-boxcar edges in shifted coords
+  const boxR = ((boxEnd - roll) % N_PHASE + N_PHASE) % N_PHASE;
+  // In-plot readout: discovered period, its ratio to the injected period, and the fitted width.
+  const pFoundMs = refinedPeriod * 1000;
+  const wFoundMs = bestW / N_PHASE * refinedPeriod * 1000;
+  const pRatio = refinedPeriod / P;                                  // discovered : injected
+  const profAnn = detected ? [
+    { text: `P = ${pFoundMs.toFixed(4)} ms`, color: '#3fb950' },
+    { text: `P/P₀ = ${pRatio.toFixed(4)}`, color: Math.abs(pRatio - 1) < 0.02 ? '#3fb950' : '#f0883e' },
+    { text: `W = ${wFoundMs.toFixed(3)} ms (${(100*bestW/N_PHASE).toFixed(1)}%)`, color: '#f778ba' },
+  ] : [{ text: 'no significant pulse detected', color: '#8b949e' }];
   drawPlot(cvPulse, {
-    data: foldShift, secondData: tmplShift, secondColor: '#f0883e',
+    data: foldShift,
     markers: [boxL, boxR], markerColor: '#f778ba',
     xLabel: 'Phase bin', yLabel: 'Flux (mJy)', color: '#3fb950', xMin: 0, xMax: N_PHASE,
+    annotations: profAnn,
   });
+
+  // 1b. Subintegration greyscale (nominal-period fold). The pulse walks in phase across time; the
+  //     two pink tracks are the drifting boxcar edges, so the pulse lies between them (the pdmp
+  //     trial-period search is what straightens/flattens this drift).
+  const centreX = s => halfP - subCtr[s] * bestDelta / totalSamp * N_PHASE;   // drifting pulse centre
+  const loOff = -(bestW >> 1), hiOff = bestW - (bestW >> 1);                   // boxcar edges vs centre
+  drawSubints(cvSubs, subProf, NSUB, N_PHASE, roll, [
+    { xOf: s => centreX(s) + loOff, color: '#f778ba' },
+    { xOf: s => centreX(s) + hiOff, color: '#f778ba' },
+  ]);
 
   // 2. Raw time series (first few periods) in mJy — single pulses are buried in the noise
   const showSamp = Math.min(nData, Math.max(Math.round(8 * Lf), 400));
@@ -862,15 +981,14 @@ function update(collectOnly) {
   const specNorm = new Float64Array(maxBinShow);
   for (let i = 0; i < maxBinShow; i++) specNorm[i] = power[i] / rms;
   let specMax = 0;
-  for (let h = 0; h < Math.min(N_SHOW, nHarmonics); h++) specMax = Math.max(specMax, harmAmp[h] / rms);
-  if (specMax <= 0) { for (let i = 1; i < maxBinShow; i++) specMax = Math.max(specMax, specNorm[i]); }  // no harmonics: scale to noise
+  for (let i = 0; i < maxBinShow; i++) specMax = Math.max(specMax, specNorm[i]);  // tallest displayed spike
   drawPlot(cvFft, {
     data: specNorm,
     xLabel: 'Frequency  f / f₀  (harmonic number)',
     yLabel: '|FFT| / rms',
     color: '#e3b341', filled: true, envelope: true,
     xMin: 0, xMax: maxBinShow / f0_bin,
-    yMin: 0, yMax: 1.1 * specMax,
+    yMin: 0, yMax: 1.05 * (specMax || 1),
   });
 
   // 4. Detection S/N at the standard harmonic-fold counts, as bar charts (best fold in green)
@@ -881,7 +999,7 @@ function update(collectOnly) {
   // 4a. method A (amplitudes)
   drawPlot(cvSn, {
     data: aVals, bars: true, cats: foldCats, barBest: aBest, color: '#d2a8ff',
-    xLabel: 'Harmonics summed', yLabel: 'S/N (σ) — amplitude sum', yMin: yBot(aVals), yMax: yTop(aVals),
+    xLabel: 'Harmonics summed', yLabel: 'S/N (σ) — naive amplitude sum', yMin: yBot(aVals), yMax: yTop(aVals),
   });
 
   // 4b. method B (powers, χ²)
@@ -891,31 +1009,37 @@ function update(collectOnly) {
   });
 
   // === Info + harmonic table ===
-  const capped = nWanted > Math.pow(2, MAX_LOG2);
   let html = '';
   html += `<strong>System:</strong> SEFD = T<sub>sys</sub>/G = ${SEFD.toFixed(1)} Jy; per-sample noise σ = ${sigma_mJy.toFixed(1)} mJy (n<sub>pol</sub>=${N_POL}, Δν=${bw} MHz, t<sub>samp</sub>=${tSampUs} µs)<br>`;
-  html += `<strong>Observation:</strong> ${tObsEff.toFixed(2)} s = ${nData.toLocaleString()} samples in a 2<sup>${log2N}</sup>-pt FFT; ${nPulses.toFixed(0)} pulses; ${Lf.toFixed(2)} samples/period${capped ? ' <span style="color:#f0883e">(capped for speed)</span>' : ''}<br>`;
+  html += `<strong>Observation:</strong> ${tObsEff.toFixed(2)} s = 2<sup>${log2N}</sup> = ${nData.toLocaleString()} real samples${padF > 1 ? `, zero-padded ${padF}× → 2<sup>${Math.log2(totalSamp)}</sup>-pt FFT (interbinned, anti-scalloping)` : ' (no padding — FFT at the length ceiling)'}; ${nPulses.toFixed(0)} pulses; ${Lf.toFixed(2)} samples/period<br>`;
   html += `<strong>Radiometer S/N (expected):</strong> <strong style="color:#58a6ff">${radioSN.toFixed(1)}</strong> = (S<sub>mean</sub>/SEFD)·√(n<sub>pol</sub>·Δν·t<sub>obs</sub>)·√((1−δ)/δ)<br>`;
-  html += `<strong>Folded-profile S/N:</strong> best boxcar = <strong style="color:#3fb950">${foldSN.toFixed(1)}</strong> (width searched → W=${bestW} bins ≈ ${(100*bestW/N_PHASE).toFixed(1)}% of period; edges in pink) · matched-filter = ${foldMatchSN.toFixed(1)}<br>`;
+  const pErrPct = 100 * (refinedPeriod - P) / P;
+  const ratio = refinedPeriod / P;                       // found-period : true-period (teaching aid only)
+  const nearK = [0.25, 1/3, 0.5, 1, 2, 3, 4].reduce((a, k) => Math.abs(ratio - k) < Math.abs(ratio - a) ? k : a, 1);
+  const harmNote = Math.abs(ratio - nearK) < 0.03 && nearK !== 1
+    ? ` <span style="color:#f0883e">— this is ${nearK < 1 ? '1/' + Math.round(1/nearK) : nearK + '×'} the true period (harmonic alias)</span>` : '';
+  const widthMs = bestW / N_PHASE * refinedPeriod * 1000;
+  html += `<strong>Found period (FFT bin ${foundFbin}${refined ? ` ${bestDelta >= 0 ? '+' : ''}${bestDelta.toFixed(3)}` : ', not refined — no significant pulse'}):</strong> `
+        + `<strong style="color:#3fb950">${(refinedPeriod*1000).toFixed(4)} ms</strong> (nominal ${(foundPeriod*1000).toFixed(4)} ms; true ${period} ms, Δ=${pErrPct >= 0 ? '+' : ''}${pErrPct.toFixed(3)}%)${harmNote}<br>`;
+  html += `<strong>Found width:</strong> W = ${bestW} bins = ${(100*bestW/N_PHASE).toFixed(1)}% of period = <strong style="color:#3fb950">${widthMs.toFixed(3)} ms</strong> (boxcar; edges in pink)<br>`;
+  html += `<strong>pdmp fold over ${NSUB} subints:</strong> trial-period search sharpened S/N ${nomSN.toFixed(1)} → <strong style="color:#3fb950">${foldSN.toFixed(1)}</strong> (×${(foldSN/Math.max(nomSN,1e-6)).toFixed(2)}); the pulse drifts between the pink boxcar edges on the greyscale<br>`;
   const aTxt = FOLD_SET.length ? `${FOLD_SET[aBest]} harmonics → ${aVals[aBest].toFixed(1)}` : 'n/a';
   const bTxt = FOLD_SET.length ? `${FOLD_SET[bBest]} harmonics → ${bVals[bBest].toFixed(1)}` : 'n/a';
-  html += `<strong>FFT harmonic sum</strong> (best fold of 1,2,3,4,6,8,12,16,24,32): A amplitudes ${aTxt}   |   B powers(χ²) <strong style="color:#39c5cf">${bTxt}</strong>   (≈${expectedHarm} significant harmonics = 1/δ; both should sit ≤ the fold)<br><br>`;
+  html += `<strong>FFT blind-search S/N:</strong> <strong style="color:#39c5cf">${bTxt} (χ² powers)</strong> — the realistic detection significance, as real search codes report it (locally-normalised power spectrum, χ² harmonic sum). Naive amplitude sum = <span style="color:#d2a8ff">${aTxt}</span> (mis-calibrated — the Rayleigh amplitude sum is skewed, so it reads high; shown only for contrast). Over ${count.toLocaleString()} trial frequencies, pure noise floors at ≈4–5σ (χ²) — that irreducible look-elsewhere floor is why real thresholds sit at 6–10σ.<br><br>`;
+  html += '<span style="color:#8b949e">Injected signal at the true period (for reference — the search does not use this):</span><br>';
   html += '<table style="font-size:0.8rem;border-collapse:collapse">';
   html += '<tr style="color:#58a6ff">'
         + '<td style="padding:2px 10px">Harmonic</td>'
         + '<td style="padding:2px 10px">Freq (Hz)</td>'
         + '<td style="padding:2px 10px">|FFT|</td>'
-        + '<td style="padding:2px 10px">S/N</td>'
-        + '<td style="padding:2px 10px">Σ S/N (1..m)</td></tr>';
-  for (let h = 0; h < harmonicBins.length; h++) {
-    const freq = harmonicBins[h] / fftDur;
-    const col = harmSN[h] > 3 ? '#3fb950' : (harmSN[h] > 1 ? '#c9d1d9' : '#8b949e');
-    const rowbg = (h + 1) === bestM ? ' background:#1a2b1a;' : '';
-    html += `<tr style="color:${col};${rowbg}"><td style="padding:2px 10px">${h+1}f₀</td>`;
-    html += `<td style="padding:2px 10px">${freq.toFixed(2)}</td>`;
-    html += `<td style="padding:2px 10px">${harmAmp[h].toExponential(2)}</td>`;
-    html += `<td style="padding:2px 10px">${harmSN[h].toFixed(1)}</td>`;
-    html += `<td style="padding:2px 10px">${sumSN[h].toFixed(1)}</td></tr>`;
+        + '<td style="padding:2px 10px">S/N (single bin)</td></tr>';
+  for (let h = 0; h < harmonicBins.length && h < 16; h++) {
+    const amp = power[harmonicBins[h]], snh = (amp - baseline) / rms;
+    const col = snh > 3 ? '#3fb950' : (snh > 1 ? '#c9d1d9' : '#8b949e');
+    html += `<tr style="color:${col}"><td style="padding:2px 10px">${h+1}f₀</td>`;
+    html += `<td style="padding:2px 10px">${(harmonicBins[h] / fftDur).toFixed(2)}</td>`;
+    html += `<td style="padding:2px 10px">${amp.toExponential(2)}</td>`;
+    html += `<td style="padding:2px 10px">${snh.toFixed(1)}</td></tr>`;
   }
   html += '</table>';
   harmonicInfo.innerHTML = html;
@@ -923,7 +1047,6 @@ function update(collectOnly) {
 
 // Event listeners
 for (const k in sl) sl[k].addEventListener('input', update);
-cbPow2.addEventListener('change', update);
 
 // Regenerate the live display with a fresh noise realization
 btnRegen.addEventListener('click', () => update());
