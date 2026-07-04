@@ -286,6 +286,18 @@ canvas {
       <div class="plot-title">Folded S/N vs FFT harmonic-sum S/N — folded trials only; cyan = χ², purple = amplitude sum; above y=x means folding gained S/N</div>
       <canvas id="cv-scatter"></canvas>
     </div>
+    <div class="plot-container" style="margin-top:14px">
+      <div class="plot-title">Oracle (known-period) folded S/N vs each method's peak FFT S/N — every trial; cyan = χ², purple = amplitude. Right of the green bar = detectable by folding; highlighted points (orange χ², magenta amplitude) = detectable but the method's #1 candidate was at the WRONG period → a MISS</div>
+      <canvas id="cv-oscatter"></canvas>
+    </div>
+    <div style="display:flex; gap:14px; flex-wrap:wrap; margin-top:14px">
+      <div class="plot-container" style="flex:1; min-width:230px">
+        <div class="plot-title">Oracle folded S/N (fold at true period) — the achievable ceiling per trial</div><canvas id="cv-oracle"></canvas>
+      </div>
+      <div class="plot-container" style="flex:1; min-width:230px">
+        <div class="plot-title">Recovery fraction χ² FFT S/N ÷ oracle S/N — 1 = fully recovered, ~0 = missed</div><canvas id="cv-ratio"></canvas>
+      </div>
+    </div>
     <div style="display:flex; gap:14px; flex-wrap:wrap; margin-top:14px">
       <div class="plot-container" style="flex:1; min-width:230px">
         <div class="plot-title">A naive — peak S/N vs winning harmonic fold (per trial)</div><canvas id="cv-fa"></canvas>
@@ -324,6 +336,8 @@ const cvSn2 = document.getElementById('cv-sn2');
 const harmonicInfo = document.getElementById('harmonic-info');
 const cvH1 = document.getElementById('cv-h1'), cvH2 = document.getElementById('cv-h2'), cvH3 = document.getElementById('cv-h3');
 const cvScatter = document.getElementById('cv-scatter');
+const cvOScatter = document.getElementById('cv-oscatter');
+const cvOracle = document.getElementById('cv-oracle'), cvRatio = document.getElementById('cv-ratio');
 const cvFA = document.getElementById('cv-fa'), cvFB = document.getElementById('cv-fb');
 const btnRegen = document.getElementById('btn-regen');
 const trialBtns = [25, 100, 250].map(n => document.getElementById('btn-t' + n));
@@ -736,6 +750,54 @@ function drawScatter(canvas, foldY, aX, bX, foldGate) {
   ctx.fillStyle = '#5a6470'; ctx.fillText('-- y = x', ml + 8, mt + 40);
 }
 
+// Oracle scatter: x = folded S/N at the KNOWN period (the achievable ceiling), y = each method's
+// peak FFT harmonic-sum S/N. The vertical bar marks "detectable by a known-ephemeris fold"
+// (foldGate); the horizontal bar is the 1% FFT gate, kept only as a reference for where the search
+// decides to fold. A MISS (calibration-free) = the pulse is oracle-detectable yet the method's #1
+// candidate is NOT at the true period, so folding where it points wouldn't recover the pulsar. Such
+// points are highlighted orange — note some sit ABOVE the fold gate: the (mis-calibrated) amplitude
+// sum happily clears the gate at a WRONG, noise period. Returns {a,b} miss counts. Every trial plots.
+function drawOracleScatter(canvas, oracleX, aY, bY, aRight, bRight, fftGate, foldGate) {
+  const pr = window.devicePixelRatio || 1, W = canvas.clientWidth, H = canvas.clientHeight;
+  canvas.width = W * pr; canvas.height = H * pr; const ctx = canvas.getContext('2d'); ctx.scale(pr, pr);
+  const ml = 50, mr = 12, mt = 10, mb = 34, pw = W - ml - mr, ph = H - mt - mb;
+  ctx.fillStyle = '#0d1117'; ctx.fillRect(0, 0, W, H);
+  if (!oracleX.length) { ctx.fillStyle = '#8b949e'; ctx.font = '12px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('run trials to populate', W / 2, H / 2); return { a: 0, b: 0 }; }
+  const all = oracleX.concat(aY, bY, [fftGate, foldGate]);
+  let lo = 0, hi = Math.max.apply(null, all); if (lo === hi) hi = lo + 1; hi += (hi - lo) * 0.05;
+  const toX = v => ml + (v - lo) / (hi - lo) * pw, toY = v => mt + (1 - (v - lo) / (hi - lo)) * ph;
+  ctx.setLineDash([5, 4]);
+  ctx.strokeStyle = '#5a6470'; ctx.beginPath(); ctx.moveTo(toX(lo), toY(lo)); ctx.lineTo(toX(hi), toY(hi)); ctx.stroke();               // y = x
+  ctx.strokeStyle = '#8b6d3a'; ctx.beginPath(); ctx.moveTo(ml, toY(fftGate)); ctx.lineTo(ml + pw, toY(fftGate)); ctx.stroke();          // 1% FFT gate (reference)
+  ctx.strokeStyle = '#2ea043'; ctx.beginPath(); ctx.moveTo(toX(foldGate), mt); ctx.lineTo(toX(foldGate), mt + ph); ctx.stroke();        // detectable bar
+  ctx.setLineDash([]);
+  // miss = oracle-detectable but the method's #1 candidate is at the WRONG period. Amplitude misses
+  // highlighted magenta, χ² misses orange, so the two methods' failures are distinguishable.
+  let nMissA = 0;
+  for (let i = 0; i < oracleX.length; i++) {                                                          // amplitude
+    const miss = oracleX[i] >= foldGate && !aRight[i];
+    if (miss) nMissA++;
+    ctx.fillStyle = miss ? '#ff6ac1' : '#d2a8ff';
+    ctx.beginPath(); ctx.arc(toX(oracleX[i]), toY(aY[i]), miss ? 3.2 : 2.3, 0, TAU); ctx.fill();
+  }
+  let nMissB = 0;
+  for (let i = 0; i < oracleX.length; i++) {                                                          // χ²
+    const miss = oracleX[i] >= foldGate && !bRight[i];
+    if (miss) nMissB++;
+    ctx.fillStyle = miss ? '#f0883e' : '#39c5cf';
+    ctx.beginPath(); ctx.arc(toX(oracleX[i]), toY(bY[i]), miss ? 3.2 : 2.3, 0, TAU); ctx.fill();
+  }
+  ctx.strokeStyle = '#3a4a5a'; ctx.beginPath(); ctx.moveTo(ml, mt); ctx.lineTo(ml, mt + ph); ctx.lineTo(ml + pw, mt + ph); ctx.stroke();
+  ctx.fillStyle = '#8b949e'; ctx.font = '10px sans-serif'; ctx.textAlign = 'center';
+  for (let j = 0; j <= 4; j++) { const v = lo + j * (hi - lo) / 4; ctx.fillText(v.toFixed(1), ml + j * pw / 4, mt + ph + 14); ctx.textAlign = 'right'; ctx.fillText(v.toFixed(1), ml - 5, toY(v) + 4); ctx.textAlign = 'center'; }
+  ctx.fillStyle = '#8b949e'; ctx.font = '12px sans-serif'; ctx.fillText('Oracle folded S/N (fold at true period)', ml + pw / 2, H - 4);
+  ctx.save(); ctx.translate(13, mt + ph / 2); ctx.rotate(-Math.PI / 2); ctx.fillText('peak FFT search S/N', 0, 0); ctx.restore();
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#f0883e'; ctx.fillText(`missed (detectable, wrong-period candidate) — χ² ${nMissB}`, ml + 8, mt + 12);
+  ctx.fillStyle = '#ff6ac1'; ctx.fillText(`amplitude ${nMissA}`, ml + 8, mt + 26);
+  return { a: nMissA, b: nMissB };
+}
+
 // Scatter of per-trial peak S/N (y) vs the harmonic number the trial peaked at (x, jittered).
 function drawFoldScatter(canvas, folds, sns, color) {
   const pr = window.devicePixelRatio || 1, W = canvas.clientWidth, H = canvas.clientHeight;
@@ -948,109 +1010,132 @@ function update(collectOnly) {
   const foundLf = totalSamp / Math.max(foundFbin, 1);   // samples per period at the found period
   const foundPeriod = foundLf * tSamp;                   // s
 
-  // Fold ONLY the single best FFT candidate, and ONLY if it cleared the 1% pre-gate. When fftPass is
-  // false these products stay at their "nothing folded" defaults (blank profile, not detected).
+  // --- pdmp-style fold at a GIVEN seed period (seedLf = samples/period). Split the observation into
+  //     subintegrations, fold each at the seed period, then δ-scan trial periods around it and co-add
+  //     the subints, maximising the folded S/N. A bin-quantised / scalloped period lets the pulse
+  //     drift in phase across the span and smear; the trial-period search re-aligns every subint and
+  //     SHARPENS the pulse (this is what PSRCHIVE's pdmp does). Phase & width are read from the data —
+  //     no a-priori template. Called TWICE: once for the blind FFT leader, once for the KNOWN
+  //     injected period (the "oracle" arm), so we can see what folding COULD have recovered. ---
+  function foldAndPdmp(seedLf) {
+    const seedFbin = totalSamp / Math.max(seedLf, 1e-9);
+    const NSUB = Math.max(1, Math.min(32, Math.floor(nData / Math.max(4 * seedLf, 1))));
+    const subLen = Math.floor(nData / NSUB);
+    const subProf = new Float64Array(NSUB * N_PHASE);
+    const subCtr = new Float64Array(NSUB);               // mean sample index of each subint
+    {
+      const cnt = new Uint32Array(NSUB * N_PHASE);
+      for (let s = 0; s < NSUB; s++) {
+        const i0 = s * subLen, i1 = (s === NSUB - 1) ? nData : (s + 1) * subLen;
+        for (let i = i0; i < i1; i++) {
+          let ph = i / seedLf; ph -= Math.floor(ph);
+          let b = Math.floor(ph * N_PHASE); if (b >= N_PHASE) b = N_PHASE - 1;
+          subProf[s * N_PHASE + b] += timeSeries[i]; cnt[s * N_PHASE + b]++;
+        }
+        for (let b = 0; b < N_PHASE; b++) { const c = cnt[s * N_PHASE + b]; if (c) subProf[s * N_PHASE + b] /= c; }
+        subCtr[s] = (i0 + i1 - 1) / 2;
+      }
+    }
+    // Co-add the subints for a trial period offset δ (bins): folding at bin seedFbin+δ instead of
+    // seedFbin drifts sample i in phase by i·δ/totalSamp cycles, so subint s shifts by subCtr·δ/… .
+    const _scratch = new Float64Array(N_PHASE);
+    function foldTrial(delta, out) {
+      const prof = out || _scratch;
+      for (let b = 0; b < N_PHASE; b++) prof[b] = 0;
+      for (let s = 0; s < NSUB; s++) {
+        const shift = subCtr[s] * delta / totalSamp * N_PHASE;          // this subint's phase shift (bins)
+        const base = s * N_PHASE;
+        for (let b = 0; b < N_PHASE; b++) {
+          let pos = b - shift; pos -= Math.floor(pos / N_PHASE) * N_PHASE;   // wrap into [0,N_PHASE)
+          const b0 = Math.floor(pos) % N_PHASE, fr = pos - Math.floor(pos), b1 = (b0 + 1) % N_PHASE;
+          prof[b] += subProf[base + b0] * (1 - fr) + subProf[base + b1] * fr;
+        }
+      }
+      return prof;
+    }
+    // Robust baseline / off-pulse rms + boxcar-width search (phase & width from the data).
+    function profStats(prof) {
+      const srt = Array.prototype.slice.call(prof).sort((a, b) => a - b);
+      const bs = srt[N_PHASE >> 1];
+      const dv = Array.from(prof, v => Math.abs(v - bs)).sort((a, b) => a - b);
+      const orms = (1.4826 * dv[N_PHASE >> 1]) || 1e-12;
+      let pk = 0, pv = -Infinity;
+      for (let b = 0; b < N_PHASE; b++) { const v = (prof[(b-1+N_PHASE)%N_PHASE] + prof[b] + prof[(b+1)%N_PHASE]) / 3; if (v > pv) { pv = v; pk = b; } }
+      let sn = -Infinity, bw = 1, st0 = pk;
+      for (let W = 1; W <= (N_PHASE >> 1); W++) {
+        const st = ((pk - (W >> 1)) % N_PHASE + N_PHASE) % N_PHASE;
+        let acc = 0; for (let k = 0; k < W; k++) acc += prof[(st + k) % N_PHASE] - bs;
+        const v = acc / (orms * Math.sqrt(W));
+        if (v > sn) { sn = v; bw = W; st0 = st; }
+      }
+      return { sn, base: bs, orms, peak: pk, bw, start: st0 };
+    }
+    // The δ-scan optimises a single SMOOTH, width-free statistic: the baseline-subtracted sum of
+    // squares of the co-added profile ("sharpness"). It peaks exactly when the subints align (the
+    // pulse is tallest / narrowest), falls off smoothly either side, and — crucially — has NO boxcar-
+    // width search and NO off-pulse rms inside the loop. (The old metric re-fit the width over 64
+    // trials AND re-estimated the rms at every δ; both injected noise into the landscape, so the
+    // argmax wandered off the true period — e.g. a 10.000 ms pulsar "refining" to 9.9997 ms.)
+    const sharpness = prof => {
+      const srt = Array.prototype.slice.call(prof).sort((a, b) => a - b);
+      const base = srt[N_PHASE >> 1];                       // robust (median) baseline
+      let v = 0; for (let b = 0; b < N_PHASE; b++) { const d = prof[b] - base; v += d * d; }
+      return v;
+    };
+    // δ = 0 folds the whole span at the seed period (no refinement). Search a grid around it;
+    // one δ bin of error = one full turn of phase drift across the observation, so ±1.2 bins covers it.
+    const nomStat = profStats(foldTrial(0));
+    let bestScore = sharpness(foldTrial(0)), bestDelta = 0;
+    const DMAX = 1.2, DSTEP = collectOnly ? 0.02 : 0.008;
+    for (let d = -DMAX; d <= DMAX + 1e-9; d += DSTEP) {
+      if (Math.abs(d) < DSTEP / 2) continue;
+      const sc = sharpness(foldTrial(d));
+      if (sc > bestScore) { bestScore = sc; bestDelta = d; }
+    }
+    // Fit the boxcar width/phase and off-pulse rms ONCE, at the chosen period (for display + S/N).
+    let bestStat = profStats(foldTrial(bestDelta));
+    // Only refine the period if the folded pulse is itself significant; else keep the seed period
+    // so a noise fold doesn't draw a spurious slanted drift track.
+    const REFINE_MIN_SN = 6;
+    if (bestStat.sn < REFINE_MIN_SN) { bestDelta = 0; bestStat = nomStat; }
+    const folded = new Float64Array(N_PHASE);
+    foldTrial(bestDelta, folded);
+    const refinedLf = totalSamp / Math.max(seedFbin + bestDelta, 1e-9);
+    return {
+      NSUB, subProf, subCtr, folded, bestDelta, refined: bestDelta !== 0,
+      foldSN: bestStat.sn, nomSN: nomStat.sn,
+      peakBin: bestStat.peak, boxStart: bestStat.start, boxEnd: (bestStat.start + bestStat.bw) % N_PHASE,
+      bestW: bestStat.bw, baseF: bestStat.base, offRms: bestStat.orms,
+      refinedLf, refinedPeriod: refinedLf * tSamp,
+    };
+  }
+
+  // --- Blind arm: fold ONLY the FFT leader, and only if it cleared the 1% pre-gate. When fftPass is
+  //     false these products stay at their "nothing folded" defaults (blank profile, not detected). ---
   let NSUB = 0, subProf = new Float64Array(0), subCtr = new Float64Array(0);
   let folded = new Float64Array(N_PHASE);
   let foldSN = 0, nomSN = 0, refined = false, bestDelta = 0;
   let peakBin = 0, boxStart = 0, boxEnd = 0, bestW = 0, baseF = 0, offRms = 1;
   let refinedLf = foundLf, refinedPeriod = foundPeriod;
-
   if (fftPass) {
-  // --- pdmp-style fold: split the observation into subintegrations, fold each at the nominal
-  //     period, then search trial periods around it and co-add the subints, maximising the folded
-  //     S/N. A bin-quantised / scalloped period lets the pulse drift in phase across the span and
-  //     smear; the trial-period search re-aligns every subint and SHARPENS the pulse (this is what
-  //     PSRCHIVE's pdmp does). Phase & width are still read from the data — no a-priori template. ---
-  NSUB = Math.max(1, Math.min(32, Math.floor(nData / Math.max(4 * foundLf, 1))));
-  const subLen = Math.floor(nData / NSUB);
-  subProf = new Float64Array(NSUB * N_PHASE);
-  subCtr = new Float64Array(NSUB);                 // mean sample index of each subint
-  {
-    const cnt = new Uint32Array(NSUB * N_PHASE);
-    for (let s = 0; s < NSUB; s++) {
-      const i0 = s * subLen, i1 = (s === NSUB - 1) ? nData : (s + 1) * subLen;
-      for (let i = i0; i < i1; i++) {
-        let ph = i / foundLf; ph -= Math.floor(ph);
-        let b = Math.floor(ph * N_PHASE); if (b >= N_PHASE) b = N_PHASE - 1;
-        subProf[s * N_PHASE + b] += timeSeries[i]; cnt[s * N_PHASE + b]++;
-      }
-      for (let b = 0; b < N_PHASE; b++) { const c = cnt[s * N_PHASE + b]; if (c) subProf[s * N_PHASE + b] /= c; }
-      subCtr[s] = (i0 + i1 - 1) / 2;
-    }
+    const R = foldAndPdmp(foundLf);
+    NSUB = R.NSUB; subProf = R.subProf; subCtr = R.subCtr; folded = R.folded;
+    foldSN = R.foldSN; nomSN = R.nomSN; refined = R.refined; bestDelta = R.bestDelta;
+    peakBin = R.peakBin; boxStart = R.boxStart; boxEnd = R.boxEnd; bestW = R.bestW;
+    baseF = R.baseF; offRms = R.offRms; refinedLf = R.refinedLf; refinedPeriod = R.refinedPeriod;
   }
 
-  // Co-add the subints for a trial period offset δ (bins): folding at bin foundFbin+δ instead of
-  // foundFbin drifts sample i in phase by i·δ/totalSamp cycles, so subint s shifts by subCtr·δ/… .
-  const _scratch = new Float64Array(N_PHASE);
-  function foldTrial(delta, out) {
-    const prof = out || _scratch;
-    for (let b = 0; b < N_PHASE; b++) prof[b] = 0;
-    for (let s = 0; s < NSUB; s++) {
-      const shift = subCtr[s] * delta / totalSamp * N_PHASE;          // this subint's phase shift (bins)
-      const base = s * N_PHASE;
-      for (let b = 0; b < N_PHASE; b++) {
-        let pos = b - shift; pos -= Math.floor(pos / N_PHASE) * N_PHASE;   // wrap into [0,N_PHASE)
-        const b0 = Math.floor(pos) % N_PHASE, fr = pos - Math.floor(pos), b1 = (b0 + 1) % N_PHASE;
-        prof[b] += subProf[base + b0] * (1 - fr) + subProf[base + b1] * fr;
-      }
-    }
-    return prof;
-  }
-  // Robust baseline / off-pulse rms + boxcar-width search (phase & width from the data).
-  function profStats(prof) {
-    const srt = Array.prototype.slice.call(prof).sort((a, b) => a - b);
-    const bs = srt[N_PHASE >> 1];
-    const dv = Array.from(prof, v => Math.abs(v - bs)).sort((a, b) => a - b);
-    const orms = (1.4826 * dv[N_PHASE >> 1]) || 1e-12;
-    let pk = 0, pv = -Infinity;
-    for (let b = 0; b < N_PHASE; b++) { const v = (prof[(b-1+N_PHASE)%N_PHASE] + prof[b] + prof[(b+1)%N_PHASE]) / 3; if (v > pv) { pv = v; pk = b; } }
-    let sn = -Infinity, bw = 1, st0 = pk;
-    for (let W = 1; W <= (N_PHASE >> 1); W++) {
-      const st = ((pk - (W >> 1)) % N_PHASE + N_PHASE) % N_PHASE;
-      let acc = 0; for (let k = 0; k < W; k++) acc += prof[(st + k) % N_PHASE] - bs;
-      const v = acc / (orms * Math.sqrt(W));
-      if (v > sn) { sn = v; bw = W; st0 = st; }
-    }
-    return { sn, base: bs, orms, peak: pk, bw, start: st0 };
-  }
-
-  // The δ-scan optimises a single SMOOTH, width-free statistic: the baseline-subtracted sum of
-  // squares of the co-added profile ("sharpness"). It peaks exactly when the subints align (the
-  // pulse is tallest / narrowest), falls off smoothly either side, and — crucially — has NO boxcar-
-  // width search and NO off-pulse rms inside the loop. (The old metric re-fit the width over 64
-  // trials AND re-estimated the rms at every δ; both injected noise into the landscape, so the
-  // argmax wandered off the true period — e.g. a 10.000 ms pulsar "refining" to 9.9997 ms.)
-  const sharpness = prof => {
-    const srt = Array.prototype.slice.call(prof).sort((a, b) => a - b);
-    const base = srt[N_PHASE >> 1];                       // robust (median) baseline
-    let v = 0; for (let b = 0; b < N_PHASE; b++) { const d = prof[b] - base; v += d * d; }
-    return v;
-  };
-  // δ = 0 folds the whole span at the nominal period (no refinement). Search a grid around it;
-  // one δ bin of error = one full turn of phase drift across the observation, so ±1.2 bins covers it.
-  const nomStat = profStats(foldTrial(0));
-  let bestScore = sharpness(foldTrial(0));
-  const DMAX = 1.2, DSTEP = collectOnly ? 0.02 : 0.008;
-  for (let d = -DMAX; d <= DMAX + 1e-9; d += DSTEP) {
-    if (Math.abs(d) < DSTEP / 2) continue;
-    const sc = sharpness(foldTrial(d));
-    if (sc > bestScore) { bestScore = sc; bestDelta = d; }
-  }
-  // Fit the boxcar width/phase and off-pulse rms ONCE, at the chosen period (for display + S/N).
-  let bestStat = profStats(foldTrial(bestDelta));
-  // Only refine the period if the folded pulse is itself significant; else keep the nominal period
-  // so a noise fold doesn't draw a spurious slanted drift track.
-  const REFINE_MIN_SN = 6;
-  if (bestStat.sn < REFINE_MIN_SN) { bestDelta = 0; bestStat = nomStat; }
-  refined = bestDelta !== 0;
-  foldTrial(bestDelta, folded);
-  baseF = bestStat.base; offRms = bestStat.orms; peakBin = bestStat.peak;
-  bestW = bestStat.bw; boxStart = bestStat.start; boxEnd = (boxStart + bestW) % N_PHASE;
-  foldSN = bestStat.sn; nomSN = nomStat.sn;
-  refinedLf = totalSamp / Math.max(foundFbin + bestDelta, 1e-9);
-  refinedPeriod = refinedLf * tSamp;                     // pdmp-refined period (s)
-  }
+  // --- Oracle arm: ALWAYS fold+pdmp at the KNOWN injected period (seed Lf = P/tSamp). This is the
+  //     folded S/N a perfect search would hand the folder — the ceiling. Comparing it against the
+  //     blind FFT S/N shows how often a genuinely detectable pulse was missed because the search
+  //     never folded it (or folded the wrong period). ---
+  //     Only meaningful when the observation covers ≥ MIN_CYCLES rotations of the true period — the
+  //     same rule the search enforces. A period longer than that can't be folded (a near-empty,
+  //     degenerate profile), so we report oracleSN = 0: not a miss, just unsearchable.
+  const trueRotations = nData / Lf;
+  const oracle = trueRotations >= MIN_CYCLES ? foldAndPdmp(Lf) : null;
+  const oracleSN = oracle ? oracle.foldSN : 0;
+  const oracleRatio = oracleSN > 1e-6 ? Math.min(snB / oracleSN, 3) : 0;   // χ² recovery fraction (capped for display)
 
   // Winner decision: the FOLDED S/N (not the FFT S/N) decides if the candidate is real, judged at
   // the selected FAR over the phase search. Only a candidate that was folded can win.
@@ -1063,7 +1148,7 @@ function update(collectOnly) {
   // Headless trial mode: return the metrics, skip all drawing. Extra fields (period recovery,
   // detection state) are ignored by the in-app trials histogram but let external tests check
   // period accuracy, alias rate, and detection behaviour against the injected signal.
-  if (collectOnly) return { foldSN, snA, snB, aFold, bFold,
+  if (collectOnly) return { foldSN, snA, snB, aFold, bFold, oracleSN, oracleRatio,
     refinedPeriod, foundPeriod, foundFbin, bestDelta, detected, radioSN, nomSN,
     truePeriod: P, periodRatio: refinedPeriod / P,
     fftPass, fftFAR, foldFAR, foldGateSigma, fftGateSigma,
@@ -1213,6 +1298,16 @@ function update(collectOnly) {
   } else {
     html += `<span style="color:#8b949e">Nothing folded — raise the flux, bandwidth, or observation length until an FFT candidate beats the 1% gate.</span><br>`;
   }
+  {
+    const oracleDetectable = oracleSN >= foldGateSigma;
+    const missed = oracleDetectable && !detected;
+    html += `<strong>Oracle fold (known period — the ceiling):</strong> folding at the TRUE period gives `
+          + `<strong style="color:${oracleDetectable ? '#3fb950' : '#8b949e'}">${oracleSN.toFixed(1)}σ</strong> `
+          + `(FAR ${fmtFAR(farFromSigma(oracleSN, N_FOLD_TRIALS))}) — `
+          + (missed ? `<span style="color:#f0883e">detectable, but the blind search did NOT fold it → a MISS</span>`
+             : detected ? `<span style="color:#3fb950">and the blind search recovered it too</span>`
+             : `<span style="color:#8b949e">not significant either — genuinely too weak to detect</span>`) + `<br>`;
+  }
   html += `<span style="color:#8b949e">(Amplitude sum, for contrast only: ${aTxt}. Detection is decided by the FOLDED S/N, as in a real survey — not the FFT S/N.)</span><br><br>`;
   html += '<span style="color:#8b949e">Injected signal at the true period (for reference — the search does not use this):</span><br>';
   html += '<table style="font-size:0.8rem;border-collapse:collapse">';
@@ -1261,12 +1356,17 @@ async function runTrials(n) {
   let bestFold = -Infinity, bestSeed = base, nDet = 0, nFolded = 0;   // winners; FFT candidates that got folded
   let strongSnB = -Infinity, strongSeed = base, strongRatio = 1;      // strongest near-miss if nothing detected
   const sFold = [], sA = [], sB = [];                 // scatter: FOLDED trials only (unfolded have no folded S/N)
+  const oS = [], oR = [];                             // oracle: folded S/N at the true period, + χ² recovery fraction
+  const oaRight = [], obRight = [];                   // per trial: did each method's #1 candidate land on the true period?
   let fftGate = 0, foldGate = 0;
   for (let t = 0; t < n; t++) {
     const seed = (base + t) >>> 0;
     seedRng(seed);
     const r = update(true);
     fold.push(r.foldSN); A.push(r.snA); B.push(r.snB); aF.push(r.aFold); bF.push(r.bFold);
+    oS.push(r.oracleSN); oR.push(r.oracleRatio);
+    oaRight.push(Math.abs(r.candPeriodA / r.truePeriod - 1) < 0.02);   // #1 candidate at the true period?
+    obRight.push(Math.abs(r.candPeriodB / r.truePeriod - 1) < 0.02);
     classify(r.candPeriodA, r.truePeriod, tA);    // method A — amplitude harmonic sum
     classify(r.candPeriodB, r.truePeriod, tB);    // method B — χ² power harmonic sum (drives the fold)
     fftGate = r.fftGateSigma; foldGate = r.foldGateSigma;
@@ -1282,6 +1382,9 @@ async function runTrials(n) {
   drawHistogram(cvH2, A, '#d2a8ff', 'FFT S/N (naive)');
   drawHistogram(cvH3, B, '#39c5cf', 'FFT S/N (better)');
   drawScatter(cvScatter, sFold, sA, sB, foldGate);
+  const miss = drawOracleScatter(cvOScatter, oS, A, B, oaRight, obRight, fftGate, foldGate);
+  drawHistogram(cvOracle, oS, '#f0c674', 'Oracle folded S/N');
+  drawHistogram(cvRatio, oR, '#8ac6d1', 'χ² S/N ÷ oracle');
   drawFoldScatter(cvFA, aF, A, '#d2a8ff');
   drawFoldScatter(cvFB, bF, B, '#39c5cf');
   const mean = a => a.reduce((x, y) => x + y, 0) / a.length;
@@ -1294,6 +1397,8 @@ async function runTrials(n) {
     + `<br><strong>#1 candidate period vs true pulsar (out of ${n}):</strong>`
     + `<br>&nbsp;&nbsp;A — amplitude sum &nbsp; ${row(tA)}`
     + `<br>&nbsp;&nbsp;B — χ² power sum &nbsp;&nbsp; ${row(tB)}`
+    + `<br><strong>Oracle check</strong> (detectable by folding at the true period, but the method's #1 candidate was at the WRONG period → folding there recovers nothing): `
+    + `B χ² <span style="color:#f0883e">${miss.b}/${n}</span> · A amplitude <span style="color:#ff6ac1">${miss.a}/${n}</span> — S/N left on the table.`
     + `<br><strong>FFT-flagged (&gt;1% gate): ${nFolded}/${n} folded → winners: ${nDet}/${n}.</strong> ` + (anyDet
         ? `<span style="color:#3fb950">Profile shows the best winner — folded S/N ${bestFold.toFixed(1)}, seed ${bestSeed}.</span>`
         : `No winners. Profile shows the strongest FFT candidate (χ² ${strongSnB.toFixed(1)}σ, seed ${strongSeed}) — ` + (Math.abs(strongRatio - 1) < 0.02
