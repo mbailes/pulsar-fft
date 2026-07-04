@@ -241,6 +241,11 @@ canvas {
     </div>
   </div>
 
+  <div id="seek-panel" style="margin:14px 0; padding:12px 14px; background:#0d1117; border:1px solid #30363d; border-radius:8px; overflow-x:auto">
+    <div style="color:#8b949e; font-size:0.85rem; margin-bottom:6px">Harmonic-fold search (seek-style) — best candidate period &amp; S/N as harmonics are summed 1→32 (winning fold highlighted)</div>
+    <div id="seek-table"></div>
+  </div>
+
   <div class="explanation">
     <h3>Why harmonics appear</h3>
     <p>
@@ -309,6 +314,7 @@ const cvPulse = document.getElementById('cv-pulse');
 const cvTime = document.getElementById('cv-time');
 const cvFft = document.getElementById('cv-fft');
 const cvSubs = document.getElementById('cv-subs');
+const seekTable = document.getElementById('seek-table');
 const cvSn = document.getElementById('cv-sn');
 const cvSn2 = document.getElementById('cv-sn2');
 const harmonicInfo = document.getElementById('harmonic-info');
@@ -429,6 +435,23 @@ function sigmaFromChi2(m, S) {
     const dx = f / (-x - 1 / x); x -= dx; if (Math.abs(dx) < 1e-10) break;
   }
   return x;
+}
+
+// Upper-tail standard-normal probability Q(x) = Φ(−x) via the Numerical Recipes erfc approximation
+// (|error| < 1.2e-7). Turns a σ significance into a per-trial false-alarm probability.
+function erfcApprox(z) {
+  const az = Math.abs(z), t = 1 / (1 + 0.5 * az);
+  const e = t * Math.exp(-az*az - 1.26551223 + t*(1.00002368 + t*(0.37409196 + t*(0.09678418 +
+    t*(-0.18628806 + t*(0.27886807 + t*(-1.13520398 + t*(1.48851587 + t*(-0.82215223 + t*0.17087277)))))))));
+  return z >= 0 ? e : 2 - e;
+}
+function normQ(x) { return 0.5 * erfcApprox(x / Math.SQRT2); }         // Φ(−x)
+function farFromSigma(sigma, N) { return Math.min(1, Math.max(0, N * normQ(sigma))); }  // look-elsewhere FAR
+function fmtFAR(p) {                                                    // compact FAR string
+  if (p >= 0.01) return (p * 100).toFixed(1) + '%';
+  if (p <= 0) return '<1e-16';
+  const e = Math.floor(Math.log10(p));
+  return (p / Math.pow(10, e)).toFixed(1) + 'e' + e;
 }
 
 function drawPlot(canvas, opts) {
@@ -804,15 +827,20 @@ function update(collectOnly) {
   const fMin = Math.max(1, Math.round(MIN_CYCLES * padF));   // lowest trial FFT bin the search considers
   const maxSearchPeriod = tObsEff / MIN_CYCLES;              // s (longest period the search will test)
 
-  // --- Detection threshold from a chosen false-alarm rate (FAR). A search examines ~nTrials trial
-  //     frequencies; under pure noise each candidate's χ² significance is a one-sided Gaussian σ, so
-  //     the chance ANY of them exceeds x is ≈ nTrials·Φ(−x). Setting that equal to the FAR and
-  //     solving gives the threshold: DETECT_MIN = −Φ⁻¹(FAR / nTrials). More trials (longer
-  //     observation) ⇒ a higher σ bar — this is the look-elsewhere penalty made explicit. ---
-  const FAR = parseFloat(selFar.value);               // false-alarm probability per whole search
-  const nTrials = Math.max(nFreq - fMin, 2);          // trial frequencies actually searched (f ≥ fMin)
-  const DETECT_MIN = -ltqnorm(FAR / nTrials);         // equivalent-Gaussian σ threshold
-  vFar.textContent = `${(FAR * 100 >= 1 ? (FAR*100).toFixed(0) : (FAR*100).toPrecision(2))}% → ${DETECT_MIN.toFixed(2)}σ (${nTrials.toLocaleString()} trials)`;
+  // --- Two-stage detection, as a real survey works ---
+  //   (1) FFT PRE-GATE: the blind harmonic search examines ~nTrials trial frequencies; under noise
+  //       the chance ANY exceeds x is ≈ nTrials·Φ(−x). We only bother FOLDING the single best
+  //       candidate if it beats a fixed 1% false-alarm bar: fftGateSigma = −Φ⁻¹(0.01/nTrials).
+  //   (2) FOLD WINNER: the folded S/N is what actually decides if the candidate is real. Its search
+  //       is over pulse phase (≈ N_PHASE trials), so at the SELECTED FAR the bar is
+  //       foldGateSigma = −Φ⁻¹(FAR/N_PHASE). More FFT trials ⇒ higher fold-gate — look-elsewhere. ---
+  const FAR = parseFloat(selFar.value);               // selected false-alarm rate, applied to the folded S/N
+  const nTrials = Math.max(nFreq - fMin, 2);          // FFT trial frequencies actually searched (f ≥ fMin)
+  const FFT_GATE_FAR = 0.01;                          // fixed pre-filter: fold only if the FFT candidate beats 1%
+  const fftGateSigma = -ltqnorm(FFT_GATE_FAR / nTrials);
+  const N_FOLD_TRIALS = N_PHASE;                      // phase-search trial budget for the folded S/N's FAR
+  const foldGateSigma = -ltqnorm(FAR / N_FOLD_TRIALS);
+  vFar.textContent = `fold ${(FAR*100 >= 1 ? (FAR*100).toFixed(0) : (FAR*100).toPrecision(2))}% → ${foldGateSigma.toFixed(2)}σ  ·  FFT gate 1% → ${fftGateSigma.toFixed(2)}σ`;
 
   // --- Harmonics of the fundamental (bin may be non-integer -> nearest-bin peak search) ---
   const f0_bin = totalSamp / Lf;                     // fundamental bin index (= fftDur / P)
@@ -857,6 +885,7 @@ function update(collectOnly) {
   //     candidate — the look-elsewhere floor set by the number of trial frequencies. ---
   const FOLD_SET = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32].filter(m => m < nFreq / 2);
   const aVals = [], bVals = [];                         // brightest-candidate S/N per fold
+  const perFold = [];                                   // seek-style: best candidate {m, bin, sigma} at each fold
   const Asum = new Float64Array(nFreq), Psum = new Float64Array(nFreq);
   for (let f = 1; f < nFreq; f++) { Asum[f] = zA[f]; Psum[f] = zP[f]; }
   let jDone = 1;
@@ -874,6 +903,7 @@ function update(collectOnly) {
     const bSig = sigmaFromChi2(m, mB), aScore = mA / Math.sqrt(m);
     aVals.push(aScore);                                       // naive amplitude z-sum (skewed → inflates)
     bVals.push(bSig);                                          // χ² equivalent-σ significance (realistic)
+    perFold.push({ m, bin: mBf, sigma: bSig });               // best candidate at this fold (seek-style)
     if (bSig > foundSig) { foundSig = bSig; foundFbin = mBf; }
     if (aScore > foundValA) { foundValA = aScore; foundFbinA = mAf; }
   }
@@ -884,20 +914,43 @@ function update(collectOnly) {
   const aFold = aBest >= 0 ? FOLD_SET[aBest] : 0;
   const bFold = bBest >= 0 ? FOLD_SET[bBest] : 0;
 
+  // FFT pre-gate: only fold the single best χ² candidate if it beats the fixed 1% false-alarm bar.
+  const fftFAR = farFromSigma(snB, nTrials);           // false-alarm probability of the best FFT candidate
+  const fftPass = snB >= fftGateSigma;                  // is there an FFT candidate worth folding?
+
+  // Per-fold significance/FAR of the winning candidate (foundFbin): S/N as harmonics are summed.
+  const foldTable = [];
+  if (fftPass) {
+    for (const m of FOLD_SET) {
+      let s = 0; for (let j = 1; j <= m; j++) { const b = j * foundFbin; if (b < nFreq) s += zP[b]; }
+      const sig = sigmaFromChi2(m, s);
+      foldTable.push({ m, sigma: sig, far: farFromSigma(sig, nTrials) });
+    }
+  }
+
   // Period FOUND by the blind search (fundamental of the best candidate). We fold at THIS period,
   // not the true one — so an FFT bin error smears the fold exactly as in a real search.
   const foundLf = totalSamp / Math.max(foundFbin, 1);   // samples per period at the found period
   const foundPeriod = foundLf * tSamp;                   // s
 
+  // Fold ONLY the single best FFT candidate, and ONLY if it cleared the 1% pre-gate. When fftPass is
+  // false these products stay at their "nothing folded" defaults (blank profile, not detected).
+  let NSUB = 0, subProf = new Float64Array(0), subCtr = new Float64Array(0);
+  let folded = new Float64Array(N_PHASE);
+  let foldSN = 0, nomSN = 0, refined = false, bestDelta = 0;
+  let peakBin = 0, boxStart = 0, boxEnd = 0, bestW = 0, baseF = 0, offRms = 1;
+  let refinedLf = foundLf, refinedPeriod = foundPeriod;
+
+  if (fftPass) {
   // --- pdmp-style fold: split the observation into subintegrations, fold each at the nominal
   //     period, then search trial periods around it and co-add the subints, maximising the folded
   //     S/N. A bin-quantised / scalloped period lets the pulse drift in phase across the span and
   //     smear; the trial-period search re-aligns every subint and SHARPENS the pulse (this is what
   //     PSRCHIVE's pdmp does). Phase & width are still read from the data — no a-priori template. ---
-  const NSUB = Math.max(1, Math.min(32, Math.floor(nData / Math.max(4 * foundLf, 1))));
+  NSUB = Math.max(1, Math.min(32, Math.floor(nData / Math.max(4 * foundLf, 1))));
   const subLen = Math.floor(nData / NSUB);
-  const subProf = new Float64Array(NSUB * N_PHASE);
-  const subCtr = new Float64Array(NSUB);                 // mean sample index of each subint
+  subProf = new Float64Array(NSUB * N_PHASE);
+  subCtr = new Float64Array(NSUB);                 // mean sample index of each subint
   {
     const cnt = new Uint32Array(NSUB * N_PHASE);
     for (let s = 0; s < NSUB; s++) {
@@ -962,7 +1015,7 @@ function update(collectOnly) {
   // δ = 0 folds the whole span at the nominal period (no refinement). Search a grid around it;
   // one δ bin of error = one full turn of phase drift across the observation, so ±1.2 bins covers it.
   const nomStat = profStats(foldTrial(0));
-  let bestDelta = 0, bestScore = sharpness(foldTrial(0));
+  let bestScore = sharpness(foldTrial(0));
   const DMAX = 1.2, DSTEP = collectOnly ? 0.02 : 0.008;
   for (let d = -DMAX; d <= DMAX + 1e-9; d += DSTEP) {
     if (Math.abs(d) < DSTEP / 2) continue;
@@ -971,21 +1024,23 @@ function update(collectOnly) {
   }
   // Fit the boxcar width/phase and off-pulse rms ONCE, at the chosen period (for display + S/N).
   let bestStat = profStats(foldTrial(bestDelta));
-  // A period refinement fit to noise is meaningless (random δ → a spurious slanted track). Refine
-  // ONLY when the blind FFT search actually detected something (snB above the look-elsewhere floor)
-  // AND the folded pulse is significant; otherwise keep the nominal period so the track stays flat.
-  const REFINE_MIN_SN = 6;                             // DETECT_MIN computed from the FAR up above
-  const detected = snB >= DETECT_MIN;
-  if (!detected || bestStat.sn < REFINE_MIN_SN) { bestDelta = 0; bestStat = nomStat; }
-  const refined = bestDelta !== 0;
-  const folded = new Float64Array(N_PHASE);
+  // Only refine the period if the folded pulse is itself significant; else keep the nominal period
+  // so a noise fold doesn't draw a spurious slanted drift track.
+  const REFINE_MIN_SN = 6;
+  if (bestStat.sn < REFINE_MIN_SN) { bestDelta = 0; bestStat = nomStat; }
+  refined = bestDelta !== 0;
   foldTrial(bestDelta, folded);
-  const baseF = bestStat.base, offRms = bestStat.orms, peakBin = bestStat.peak;
-  const bestW = bestStat.bw, boxStart = bestStat.start, boxEnd = (boxStart + bestW) % N_PHASE;
-  const foldSN = bestStat.sn;                             // sharpened (best trial period) S/N
-  const nomSN = nomStat.sn;                               // S/N folding the whole span at nominal
-  const refinedLf = totalSamp / Math.max(foundFbin + bestDelta, 1e-9);
-  const refinedPeriod = refinedLf * tSamp;               // pdmp-refined period (s)
+  baseF = bestStat.base; offRms = bestStat.orms; peakBin = bestStat.peak;
+  bestW = bestStat.bw; boxStart = bestStat.start; boxEnd = (boxStart + bestW) % N_PHASE;
+  foldSN = bestStat.sn; nomSN = nomStat.sn;
+  refinedLf = totalSamp / Math.max(foundFbin + bestDelta, 1e-9);
+  refinedPeriod = refinedLf * tSamp;                     // pdmp-refined period (s)
+  }
+
+  // Winner decision: the FOLDED S/N (not the FFT S/N) decides if the candidate is real, judged at
+  // the selected FAR over the phase search. Only a candidate that was folded can win.
+  const foldFAR = fftPass ? farFromSigma(foldSN, N_FOLD_TRIALS) : 1;
+  const detected = fftPass && foldSN >= foldGateSigma;
 
   // --- Expected radiometer S/N ---
   const radioSN = (Smean / 1000) / SEFD * Math.sqrt(N_POL * bw * 1e6 * tObsEff) * Math.sqrt((1 - duty) / duty);
@@ -995,7 +1050,8 @@ function update(collectOnly) {
   // period accuracy, alias rate, and detection behaviour against the injected signal.
   if (collectOnly) return { foldSN, snA, snB, aFold, bFold,
     refinedPeriod, foundPeriod, foundFbin, bestDelta, detected, radioSN, nomSN,
-    truePeriod: P, periodRatio: refinedPeriod / P, detectMin: DETECT_MIN,
+    truePeriod: P, periodRatio: refinedPeriod / P,
+    fftPass, fftFAR, foldFAR, foldGateSigma, fftGateSigma,
     // #1-candidate period from each harmonic-summing method (nominal, before pdmp) for classification
     candPeriodA: totalSamp / Math.max(foundFbinA, 1) * tSamp, candPeriodB: foundPeriod };
 
@@ -1013,19 +1069,23 @@ function update(collectOnly) {
   const pFoundMs = refinedPeriod * 1000;
   const wFoundMs = bestW / N_PHASE * refinedPeriod * 1000;
   const pRatio = refinedPeriod / P;                                  // discovered : injected
-  // When nothing crosses the detection threshold, still report the strongest candidate the blind
-  // search turned up (its χ² S/N and the period it sits at) so the near-miss is visible.
-  const profAnn = detected ? [
-    { text: `S/N = ${foldSN.toFixed(1)}σ`, color: '#3fb950' },
-    { text: `P = ${pFoundMs.toFixed(4)} ms`, color: '#3fb950' },
-    { text: `P/P₀ = ${pRatio.toFixed(4)}`, color: Math.abs(pRatio - 1) < 0.02 ? '#3fb950' : '#f0883e' },
-    { text: `W = ${wFoundMs.toFixed(3)} ms (${(100*bestW/N_PHASE).toFixed(1)}%)`, color: '#f778ba' },
-    { text: `found in ${bFold}-harmonic fold`, color: '#39c5cf' },
+  // Three states: (1) no FFT candidate cleared the 1% gate → nothing folded; (2) folded but the
+  // folded S/N did not clear the winner FAR; (3) winner — a real detection by its folded S/N.
+  const profAnn = !fftPass ? [
+    { text: `no FFT candidate above 1% FAR`, color: '#8b949e' },
+    { text: `best FFT S/N = ${snB.toFixed(1)}σ (FAR ${fmtFAR(fftFAR)})`, color: '#8b949e' },
+    { text: `nothing folded`, color: '#8b949e' },
+  ] : detected ? [
+    { text: `WINNER · folded S/N = ${foldSN.toFixed(1)}σ`, color: '#3fb950' },
+    { text: `fold FAR ${fmtFAR(foldFAR)} (< ${(FAR*100 >= 1 ? (FAR*100).toFixed(0) : (FAR*100).toPrecision(2))}%)`, color: '#3fb950' },
+    { text: `P = ${pFoundMs.toFixed(4)} ms  ·  P/P₀ = ${pRatio.toFixed(4)}`, color: Math.abs(pRatio - 1) < 0.02 ? '#3fb950' : '#f0883e' },
+    { text: `W = ${wFoundMs.toFixed(3)} ms (${(100*bestW/N_PHASE).toFixed(1)}%)  ·  ${bFold}-harmonic fold`, color: '#f778ba' },
     ...(trialTag ? [{ text: trialTag, color: '#8b949e' }] : []),
   ] : [
-    { text: `no significant pulse (< ${DETECT_MIN}σ)`, color: '#8b949e' },
-    { text: `best S/N = ${snB.toFixed(1)}σ`, color: '#8b949e' },
-    { text: `at P = ${(foundPeriod * 1000).toFixed(4)} ms`, color: '#8b949e' },
+    { text: `folded, but NOT a winner`, color: '#f0883e' },
+    { text: `folded S/N = ${foldSN.toFixed(1)}σ (FAR ${fmtFAR(foldFAR)})`, color: '#f0883e' },
+    { text: `above the ${(FAR*100 >= 1 ? (FAR*100).toFixed(0) : (FAR*100).toPrecision(2))}% winner FAR bar`, color: '#8b949e' },
+    { text: `FFT candidate P = ${pFoundMs.toFixed(4)} ms`, color: '#8b949e' },
   ];
   drawPlot(cvPulse, {
     data: foldShift,
@@ -1043,6 +1103,23 @@ function update(collectOnly) {
     { xOf: s => centreX(s) + loOff, color: '#f778ba' },
     { xOf: s => centreX(s) + hiOff, color: '#f778ba' },
   ]);
+
+  // 1c. seek-style harmonic-fold table: best candidate period & S/N at 1,2,4,8,16,32 harmonics.
+  {
+    const seekFolds = perFold.filter(p => (p.m & (p.m - 1)) === 0);   // powers of two only
+    const bestSeekM = seekFolds.length ? seekFolds.reduce((a, b) => b.sigma > a.sigma ? b : a).m : -1;
+    const cell = (s, ex = '') => `<td style="padding:3px 12px;border:1px solid #21262d;${ex}">${s}</td>`;
+    const hi = m => m === bestSeekM ? 'background:#12261a;' : '';
+    let t = '<table style="border-collapse:collapse;font-size:0.82rem;white-space:nowrap">';
+    t += '<tr style="color:#58a6ff">' + cell('Harmonics summed');
+    for (const p of seekFolds) t += cell(p.m === 1 ? '1 (fund)' : p.m, hi(p.m) + (p.m === bestSeekM ? 'color:#3fb950;' : ''));
+    t += '</tr><tr style="color:#c9d1d9">' + cell('Best period (ms)');
+    for (const p of seekFolds) t += cell((totalSamp / Math.max(p.bin, 1) * tSamp * 1000).toFixed(4), hi(p.m));
+    t += '</tr><tr style="color:#c9d1d9">' + cell('Best S/N (σ)');
+    for (const p of seekFolds) t += cell(p.sigma.toFixed(2), hi(p.m) + (p.m === bestSeekM ? 'color:#3fb950;font-weight:600;' : (p.sigma >= fftGateSigma ? '' : 'color:#8b949e;')));
+    t += '</tr></table>';
+    seekTable.innerHTML = t;
+  }
 
   // 2. Raw time series (first few periods) in mJy — single pulses are buried in the noise
   const showSamp = Math.min(nData, Math.max(Math.round(8 * Lf), 400));
@@ -1091,19 +1168,31 @@ function update(collectOnly) {
   html += `<strong>Observation:</strong> ${tObsEff.toFixed(2)} s = 2<sup>${log2N}</sup> = ${nData.toLocaleString()} real samples${padF > 1 ? `, zero-padded ${padF}× → 2<sup>${Math.log2(totalSamp)}</sup>-pt FFT (interbinned, anti-scalloping)` : ' (no padding — FFT at the length ceiling)'}; ${nPulses.toFixed(0)} pulses; ${Lf.toFixed(2)} samples/period<br>`;
   html += `<strong>Search range:</strong> only periods P ≤ t<sub>obs</sub>/${MIN_CYCLES} = <strong>${maxSearchPeriod < 1 ? (maxSearchPeriod*1000).toFixed(1)+' ms' : maxSearchPeriod.toFixed(3)+' s'}</strong> are tested (≥ ${MIN_CYCLES} rotations needed to trust a periodicity); ${(period*1e-3) > maxSearchPeriod ? '<span style="color:#f0883e">the injected period is LONGER than this — the search cannot find it</span>' : `${nTrials.toLocaleString()} trial frequencies searched`}<br>`;
   html += `<strong>Radiometer S/N (expected):</strong> <strong style="color:#58a6ff">${radioSN.toFixed(1)}</strong> = (S<sub>mean</sub>/SEFD)·√(n<sub>pol</sub>·Δν·t<sub>obs</sub>)·√((1−δ)/δ)<br>`;
-  const pErrPct = 100 * (refinedPeriod - P) / P;
-  const ratio = refinedPeriod / P;                       // found-period : true-period (teaching aid only)
-  const nearK = [0.25, 1/3, 0.5, 1, 2, 3, 4].reduce((a, k) => Math.abs(ratio - k) < Math.abs(ratio - a) ? k : a, 1);
-  const harmNote = Math.abs(ratio - nearK) < 0.03 && nearK !== 1
-    ? ` <span style="color:#f0883e">— this is ${nearK < 1 ? '1/' + Math.round(1/nearK) : nearK + '×'} the true period (harmonic alias)</span>` : '';
-  const widthMs = bestW / N_PHASE * refinedPeriod * 1000;
-  html += `<strong>Found period (FFT bin ${foundFbin}${refined ? ` ${bestDelta >= 0 ? '+' : ''}${bestDelta.toFixed(3)}` : ', not refined — no significant pulse'}):</strong> `
-        + `<strong style="color:#3fb950">${(refinedPeriod*1000).toFixed(4)} ms</strong> (nominal ${(foundPeriod*1000).toFixed(4)} ms; true ${period} ms, Δ=${pErrPct >= 0 ? '+' : ''}${pErrPct.toFixed(3)}%)${harmNote}<br>`;
-  html += `<strong>Found width:</strong> W = ${bestW} bins = ${(100*bestW/N_PHASE).toFixed(1)}% of period = <strong style="color:#3fb950">${widthMs.toFixed(3)} ms</strong> (boxcar; edges in pink)<br>`;
-  html += `<strong>pdmp fold over ${NSUB} subints:</strong> trial-period search sharpened S/N ${nomSN.toFixed(1)} → <strong style="color:#3fb950">${foldSN.toFixed(1)}</strong> (×${(foldSN/Math.max(nomSN,1e-6)).toFixed(2)}); the pulse drifts between the pink boxcar edges on the greyscale<br>`;
+  const farPctTxt = FAR*100 >= 1 ? (FAR*100).toFixed(0) : (FAR*100).toPrecision(2);
   const aTxt = FOLD_SET.length ? `${FOLD_SET[aBest]} harmonics → ${aVals[aBest].toFixed(1)}` : 'n/a';
-  const bTxt = FOLD_SET.length ? `${FOLD_SET[bBest]} harmonics → ${bVals[bBest].toFixed(1)}` : 'n/a';
-  html += `<strong>FFT blind-search S/N:</strong> <strong style="color:#39c5cf">${bTxt} (χ² powers)</strong> — the realistic detection significance, as real search codes report it (locally-normalised power spectrum, χ² harmonic sum). Naive amplitude sum = <span style="color:#d2a8ff">${aTxt}</span> (mis-calibrated — the Rayleigh amplitude sum is skewed, so it reads high; shown only for contrast). Over ${count.toLocaleString()} trial frequencies, pure noise floors at ≈4–5σ (χ²) — that irreducible look-elsewhere floor is why thresholds are set from a false-alarm rate: at the chosen ${(FAR*100 >= 1 ? (FAR*100).toFixed(0) : (FAR*100).toPrecision(2))}% FAR the bar is <strong style="color:#39c5cf">${DETECT_MIN.toFixed(2)}σ</strong> = −Φ⁻¹(FAR/${nTrials.toLocaleString()}).<br><br>`;
+  // Stage 1 — the single best FFT candidate and the fixed 1% pre-gate.
+  html += `<strong>Best FFT candidate:</strong> bin ${foundFbin} (P = ${(foundPeriod*1000).toFixed(4)} ms), χ² <strong style="color:#39c5cf">${snB.toFixed(1)}σ</strong> summing ${bFold} harmonics; FAR = ${fmtFAR(fftFAR)} `
+        + (fftPass ? `<span style="color:#3fb950">→ clears the 1% gate → folded</span>` : `<span style="color:#f0883e">→ below the 1% gate → NOT folded</span>`) + `<br>`;
+  if (fftPass) {
+    const pErrPct = 100 * (refinedPeriod - P) / P;
+    const ratio = refinedPeriod / P;
+    const nearK = [0.25, 1/3, 0.5, 1, 2, 3, 4].reduce((a, k) => Math.abs(ratio - k) < Math.abs(ratio - a) ? k : a, 1);
+    const harmNote = Math.abs(ratio - nearK) < 0.03 && nearK !== 1
+      ? ` <span style="color:#f0883e">— ${nearK < 1 ? '1/' + Math.round(1/nearK) : nearK + '×'} the true period (harmonic alias)</span>` : '';
+    const widthMs = bestW / N_PHASE * refinedPeriod * 1000;
+    html += `<strong>pdmp fold over ${NSUB} subints:</strong> refined P = <strong style="color:#3fb950">${(refinedPeriod*1000).toFixed(4)} ms</strong> (true ${period} ms, Δ=${pErrPct >= 0 ? '+' : ''}${pErrPct.toFixed(3)}%)${harmNote}; W = ${bestW} bins = ${widthMs.toFixed(3)} ms; nominal→sharpened folded S/N ${nomSN.toFixed(1)} → ${foldSN.toFixed(1)}<br>`;
+    html += `<strong>Winner test (folded S/N decides):</strong> folded <strong style="color:${detected ? '#3fb950' : '#f0883e'}">${foldSN.toFixed(1)}σ</strong>, FAR = ${fmtFAR(foldFAR)} vs the ${farPctTxt}% bar (${foldGateSigma.toFixed(2)}σ) → ${detected ? '<strong style="color:#3fb950">REAL detection</strong>' : '<span style="color:#f0883e">rejected — folds up to noise</span>'}<br>`;
+    html += `<strong>Winner S/N vs harmonics summed:</strong><table style="font-size:0.8rem;border-collapse:collapse;margin:3px 0">`
+          + '<tr style="color:#58a6ff"><td style="padding:2px 10px">Harmonics</td><td style="padding:2px 10px">χ² S/N (σ)</td><td style="padding:2px 10px">FAR</td></tr>';
+    for (const r of foldTable) {
+      const col = r.m === bFold ? '#3fb950' : (r.sigma >= fftGateSigma ? '#c9d1d9' : '#8b949e');
+      html += `<tr style="color:${col}"><td style="padding:2px 10px">${r.m}</td><td style="padding:2px 10px">${r.sigma.toFixed(2)}</td><td style="padding:2px 10px">${fmtFAR(r.far)}</td></tr>`;
+    }
+    html += '</table>';
+  } else {
+    html += `<span style="color:#8b949e">Nothing folded — raise the flux, bandwidth, or observation length until an FFT candidate beats the 1% gate.</span><br>`;
+  }
+  html += `<span style="color:#8b949e">(Amplitude sum, for contrast only: ${aTxt}. Detection is decided by the FOLDED S/N, as in a real survey — not the FFT S/N.)</span><br><br>`;
   html += '<span style="color:#8b949e">Injected signal at the true period (for reference — the search does not use this):</span><br>';
   html += '<table style="font-size:0.8rem;border-collapse:collapse">';
   html += '<tr style="color:#58a6ff">'
@@ -1148,19 +1237,18 @@ async function runTrials(n) {
   // Each trial gets a REMEMBERED seed (base + t) so any of them — in particular the best — can be
   // regenerated bit-for-bit later. base varies per run so repeated "Run trials" give fresh noise.
   const base = (Math.floor(Math.random() * 0x7fffffff)) >>> 0;
-  let bestFold = -Infinity, bestSeed = base, nDet = 0;   // best DETECTED trial by folded S/N
-  let strongSnB = -Infinity, strongSeed = base, strongRatio = 1;   // strongest near-miss if nothing detected
-  let DETMIN = 8;
+  let bestFold = -Infinity, bestSeed = base, nDet = 0, nFolded = 0;   // winners; FFT candidates that got folded
+  let strongSnB = -Infinity, strongSeed = base, strongRatio = 1;      // strongest near-miss if nothing detected
   for (let t = 0; t < n; t++) {
     const seed = (base + t) >>> 0;
     seedRng(seed);
     const r = update(true);
-    DETMIN = r.detectMin;
     fold.push(r.foldSN); A.push(r.snA); B.push(r.snB); aF.push(r.aFold); bF.push(r.bFold);
     classify(r.candPeriodA, r.truePeriod, tA);    // method A — amplitude harmonic sum
     classify(r.candPeriodB, r.truePeriod, tB);    // method B — χ² power harmonic sum (drives the fold)
-    // Rank the "best" trial ONLY among genuine detections — an undetected trial's folded S/N is an
-    // optimised noise fluctuation, so it must not win. Keep the strongest near-miss as a fallback.
+    if (r.fftPass) nFolded++;                       // FFT candidate cleared the 1% gate → was folded
+    // Winner = detected (folded S/N clears the FAR bar). An undetected fold is an optimised noise
+    // fluctuation, so only detections may become the displayed best.
     if (r.detected) { nDet++; if (r.foldSN > bestFold) { bestFold = r.foldSN; bestSeed = seed; } }
     if (r.snB > strongSnB) { strongSnB = r.snB; strongSeed = seed; strongRatio = r.periodRatio; }
     if (t % 5 === 4) { trialStatus.textContent = `running… ${t + 1}/${n}`; await new Promise(res => setTimeout(res, 0)); }
@@ -1182,10 +1270,10 @@ async function runTrials(n) {
     + `<br><strong>#1 candidate period vs true pulsar (out of ${n}):</strong>`
     + `<br>&nbsp;&nbsp;A — amplitude sum &nbsp; ${row(tA)}`
     + `<br>&nbsp;&nbsp;B — χ² power sum &nbsp;&nbsp; ${row(tB)}`
-    + `<br><strong>Detected (χ² ≥ ${DETMIN}σ): ${nDet}/${n}.</strong> ` + (anyDet
-        ? `<span style="color:#3fb950">Profile shows the best detection — folded S/N ${bestFold.toFixed(1)}, seed ${bestSeed}.</span>`
-        : `None reached ${DETMIN}σ. Profile shows the strongest candidate (χ² ${strongSnB.toFixed(1)}σ, seed ${strongSeed}) — ` + (Math.abs(strongRatio - 1) < 0.02
-            ? `<span style="color:#f0883e">the real pulsar at the right period (P/P₀ ${strongRatio.toFixed(3)}), just too weak to claim above ${DETMIN}σ.</span>`
+    + `<br><strong>FFT-flagged (&gt;1% gate): ${nFolded}/${n} folded → winners: ${nDet}/${n}.</strong> ` + (anyDet
+        ? `<span style="color:#3fb950">Profile shows the best winner — folded S/N ${bestFold.toFixed(1)}, seed ${bestSeed}.</span>`
+        : `No winners. Profile shows the strongest FFT candidate (χ² ${strongSnB.toFixed(1)}σ, seed ${strongSeed}) — ` + (Math.abs(strongRatio - 1) < 0.02
+            ? `<span style="color:#f0883e">the real pulsar at the right period (P/P₀ ${strongRatio.toFixed(3)}), just too weak to win.</span>`
             : `<span style="color:#8b949e">at the wrong period (P/P₀ ${strongRatio.toFixed(2)}) — a noise fluctuation.</span>`));
   trialBtns.forEach(b => b.disabled = false); btnRegen.disabled = false;
   // Replay the chosen realization into the main panels so its folded profile + pdmp are on screen.
