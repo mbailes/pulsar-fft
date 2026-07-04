@@ -187,6 +187,15 @@ canvas {
       <input type="range" id="sl-tsys" min="5" max="100" step="1" value="25">
     </div>
     <div class="control-group">
+      <label>Detection false-alarm rate</label>
+      <span class="value" id="v-far">—</span>
+      <select id="sel-far" style="background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:5px;padding:4px 6px;font-size:0.85rem">
+        <option value="0.01">1% per search</option>
+        <option value="0.001" selected>0.1% per search</option>
+        <option value="0.0001">0.01% per search</option>
+      </select>
+    </div>
+    <div class="control-group">
       <label>Presets</label>
       <div class="presets">
         <button onclick="setPreset({tsamp:6,period:10,duty:5,tobs:10,flux:1,bw:340,gain:0.735,tsys:25})">Parkes MB</button>
@@ -199,7 +208,9 @@ canvas {
 
   <div class="presets" style="margin:0 0 14px; align-items:center">
     <button id="btn-regen">🎲 Regenerate (new noise)</button>
-    <button id="btn-trials">Run 100 trials</button>
+    <button id="btn-t25">Run 25 trials</button>
+    <button id="btn-t100">Run 100 trials</button>
+    <button id="btn-t250">Run 250 trials</button>
     <span id="trial-status" style="color:#8b949e; margin-left:6px"></span>
   </div>
 
@@ -304,8 +315,10 @@ const harmonicInfo = document.getElementById('harmonic-info');
 const cvH1 = document.getElementById('cv-h1'), cvH2 = document.getElementById('cv-h2'), cvH3 = document.getElementById('cv-h3');
 const cvScatter = document.getElementById('cv-scatter');
 const cvFA = document.getElementById('cv-fa'), cvFB = document.getElementById('cv-fb');
-const btnRegen = document.getElementById('btn-regen'), btnTrials = document.getElementById('btn-trials');
+const btnRegen = document.getElementById('btn-regen');
+const trialBtns = [25, 100, 250].map(n => document.getElementById('btn-t' + n));
 const trialStatus = document.getElementById('trial-status');
+const selFar = document.getElementById('sel-far'), vFar = document.getElementById('v-far');
 
 function setPreset(p) {
   const q = Object.assign({}, p);
@@ -362,9 +375,24 @@ function nextPow2(n) {
   return p;
 }
 
+// Seedable uniform RNG so the "run trials" summary can REPLAY its best realization for display.
+// _rng is plain Math.random for live use; seedRng() swaps in a deterministic mulberry32 stream.
+let _rng = Math.random;
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function seedRng(s) { _rng = mulberry32(s >>> 0); }
+function unseedRng() { _rng = Math.random; }
+let trialTag = '';   // set while replaying a remembered trial, so its profile plot is labelled
+
 function gaussRandom() {
   // Box-Muller
-  let u1 = Math.random(), u2 = Math.random();
+  let u1 = _rng() || 1e-12, u2 = _rng();
   return Math.sqrt(-2 * Math.log(u1)) * Math.cos(TAU * u2);
 }
 
@@ -768,6 +796,16 @@ function update(collectOnly) {
   const power = new Float64Array(nFreq);             // |X_k| (magnitude)
   for (let i = 0; i < nFreq; i++) power[i] = Math.hypot(re[i], im[i]);
 
+  // --- Detection threshold from a chosen false-alarm rate (FAR). A search examines ~nFreq trial
+  //     frequencies; under pure noise each candidate's χ² significance is a one-sided Gaussian σ, so
+  //     the chance ANY of the nFreq trials exceeds x is ≈ nFreq·Φ(−x). Setting that equal to the FAR
+  //     and solving gives the threshold: DETECT_MIN = −Φ⁻¹(FAR / nFreq). More trials (longer
+  //     observation) ⇒ a higher σ bar — this is the look-elsewhere penalty made explicit. ---
+  const FAR = parseFloat(selFar.value);               // false-alarm probability per whole search
+  const nTrials = Math.max(nFreq, 2);
+  const DETECT_MIN = -ltqnorm(FAR / nTrials);         // equivalent-Gaussian σ threshold
+  vFar.textContent = `${(FAR * 100 >= 1 ? (FAR*100).toFixed(0) : (FAR*100).toPrecision(2))}% → ${DETECT_MIN.toFixed(2)}σ (${nTrials.toLocaleString()} trials)`;
+
   // --- Harmonics of the fundamental (bin may be non-integer -> nearest-bin peak search) ---
   const f0_bin = totalSamp / Lf;                     // fundamental bin index (= fftDur / P)
   const N_HARM = 32;
@@ -928,7 +966,7 @@ function update(collectOnly) {
   // A period refinement fit to noise is meaningless (random δ → a spurious slanted track). Refine
   // ONLY when the blind FFT search actually detected something (snB above the look-elsewhere floor)
   // AND the folded pulse is significant; otherwise keep the nominal period so the track stays flat.
-  const DETECT_MIN = 8, REFINE_MIN_SN = 6;
+  const REFINE_MIN_SN = 6;                             // DETECT_MIN computed from the FAR up above
   const detected = snB >= DETECT_MIN;
   if (!detected || bestStat.sn < REFINE_MIN_SN) { bestDelta = 0; bestStat = nomStat; }
   const refined = bestDelta !== 0;
@@ -949,7 +987,7 @@ function update(collectOnly) {
   // period accuracy, alias rate, and detection behaviour against the injected signal.
   if (collectOnly) return { foldSN, snA, snB, aFold, bFold,
     refinedPeriod, foundPeriod, foundFbin, bestDelta, detected, radioSN, nomSN,
-    truePeriod: P, periodRatio: refinedPeriod / P,
+    truePeriod: P, periodRatio: refinedPeriod / P, detectMin: DETECT_MIN,
     // #1-candidate period from each harmonic-summing method (nominal, before pdmp) for classification
     candPeriodA: totalSamp / Math.max(foundFbinA, 1) * tSamp, candPeriodB: foundPeriod };
 
@@ -974,6 +1012,8 @@ function update(collectOnly) {
     { text: `P = ${pFoundMs.toFixed(4)} ms`, color: '#3fb950' },
     { text: `P/P₀ = ${pRatio.toFixed(4)}`, color: Math.abs(pRatio - 1) < 0.02 ? '#3fb950' : '#f0883e' },
     { text: `W = ${wFoundMs.toFixed(3)} ms (${(100*bestW/N_PHASE).toFixed(1)}%)`, color: '#f778ba' },
+    { text: `found in ${bFold}-harmonic fold`, color: '#39c5cf' },
+    ...(trialTag ? [{ text: trialTag, color: '#8b949e' }] : []),
   ] : [
     { text: `no significant pulse (< ${DETECT_MIN}σ)`, color: '#8b949e' },
     { text: `best S/N = ${snB.toFixed(1)}σ`, color: '#8b949e' },
@@ -1054,7 +1094,7 @@ function update(collectOnly) {
   html += `<strong>pdmp fold over ${NSUB} subints:</strong> trial-period search sharpened S/N ${nomSN.toFixed(1)} → <strong style="color:#3fb950">${foldSN.toFixed(1)}</strong> (×${(foldSN/Math.max(nomSN,1e-6)).toFixed(2)}); the pulse drifts between the pink boxcar edges on the greyscale<br>`;
   const aTxt = FOLD_SET.length ? `${FOLD_SET[aBest]} harmonics → ${aVals[aBest].toFixed(1)}` : 'n/a';
   const bTxt = FOLD_SET.length ? `${FOLD_SET[bBest]} harmonics → ${bVals[bBest].toFixed(1)}` : 'n/a';
-  html += `<strong>FFT blind-search S/N:</strong> <strong style="color:#39c5cf">${bTxt} (χ² powers)</strong> — the realistic detection significance, as real search codes report it (locally-normalised power spectrum, χ² harmonic sum). Naive amplitude sum = <span style="color:#d2a8ff">${aTxt}</span> (mis-calibrated — the Rayleigh amplitude sum is skewed, so it reads high; shown only for contrast). Over ${count.toLocaleString()} trial frequencies, pure noise floors at ≈4–5σ (χ²) — that irreducible look-elsewhere floor is why real thresholds sit at 6–10σ.<br><br>`;
+  html += `<strong>FFT blind-search S/N:</strong> <strong style="color:#39c5cf">${bTxt} (χ² powers)</strong> — the realistic detection significance, as real search codes report it (locally-normalised power spectrum, χ² harmonic sum). Naive amplitude sum = <span style="color:#d2a8ff">${aTxt}</span> (mis-calibrated — the Rayleigh amplitude sum is skewed, so it reads high; shown only for contrast). Over ${count.toLocaleString()} trial frequencies, pure noise floors at ≈4–5σ (χ²) — that irreducible look-elsewhere floor is why thresholds are set from a false-alarm rate: at the chosen ${(FAR*100 >= 1 ? (FAR*100).toFixed(0) : (FAR*100).toPrecision(2))}% FAR the bar is <strong style="color:#39c5cf">${DETECT_MIN.toFixed(2)}σ</strong> = −Φ⁻¹(FAR/${nTrials.toLocaleString()}).<br><br>`;
   html += '<span style="color:#8b949e">Injected signal at the true period (for reference — the search does not use this):</span><br>';
   html += '<table style="font-size:0.8rem;border-collapse:collapse">';
   html += '<tr style="color:#58a6ff">'
@@ -1076,6 +1116,7 @@ function update(collectOnly) {
 
 // Event listeners
 for (const k in sl) sl[k].addEventListener('input', update);
+selFar.addEventListener('change', update);
 
 // Regenerate the live display with a fresh noise realization
 btnRegen.addEventListener('click', () => update());
@@ -1083,7 +1124,7 @@ btnRegen.addEventListener('click', () => update());
 // Run N trials (fresh noise each), collect the three S/N metrics, draw histograms + scatter.
 // Chunked with setTimeout so the UI stays responsive and shows progress.
 async function runTrials(n) {
-  btnTrials.disabled = true; btnRegen.disabled = true;
+  trialBtns.forEach(b => b.disabled = true); btnRegen.disabled = true;
   const fold = [], A = [], B = [], aF = [], bF = [];
   // Per-method tally of the #1 candidate's period vs the injected pulsar:
   //   right = the true fundamental; harmonic = a 1/4…4× alias; wrong = anything else (noise bin).
@@ -1095,13 +1136,27 @@ async function runTrials(n) {
     else if (HARMS.some(k => Math.abs(r - k) < 0.02 * k)) t.harm++;
     else t.wrong++;
   };
+  // Each trial gets a REMEMBERED seed (base + t) so any of them — in particular the best — can be
+  // regenerated bit-for-bit later. base varies per run so repeated "Run trials" give fresh noise.
+  const base = (Math.floor(Math.random() * 0x7fffffff)) >>> 0;
+  let bestFold = -Infinity, bestSeed = base, nDet = 0;   // best DETECTED trial by folded S/N
+  let strongSnB = -Infinity, strongSeed = base, strongRatio = 1;   // strongest near-miss if nothing detected
+  let DETMIN = 8;
   for (let t = 0; t < n; t++) {
+    const seed = (base + t) >>> 0;
+    seedRng(seed);
     const r = update(true);
+    DETMIN = r.detectMin;
     fold.push(r.foldSN); A.push(r.snA); B.push(r.snB); aF.push(r.aFold); bF.push(r.bFold);
     classify(r.candPeriodA, r.truePeriod, tA);    // method A — amplitude harmonic sum
     classify(r.candPeriodB, r.truePeriod, tB);    // method B — χ² power harmonic sum (drives the fold)
+    // Rank the "best" trial ONLY among genuine detections — an undetected trial's folded S/N is an
+    // optimised noise fluctuation, so it must not win. Keep the strongest near-miss as a fallback.
+    if (r.detected) { nDet++; if (r.foldSN > bestFold) { bestFold = r.foldSN; bestSeed = seed; } }
+    if (r.snB > strongSnB) { strongSnB = r.snB; strongSeed = seed; strongRatio = r.periodRatio; }
     if (t % 5 === 4) { trialStatus.textContent = `running… ${t + 1}/${n}`; await new Promise(res => setTimeout(res, 0)); }
   }
+  unseedRng();
   drawHistogram(cvH1, fold, '#3fb950', 'Folded S/N');
   drawHistogram(cvH2, A, '#d2a8ff', 'FFT S/N (naive)');
   drawHistogram(cvH3, B, '#39c5cf', 'FFT S/N (better)');
@@ -1109,18 +1164,29 @@ async function runTrials(n) {
   drawFoldScatter(cvFA, aF, A, '#d2a8ff');
   drawFoldScatter(cvFB, bF, B, '#39c5cf');
   const mean = a => a.reduce((x, y) => x + y, 0) / a.length;
-  const row = (label, t) => `${label}: `
-    + `<span style="color:#3fb950">right ${t.right}</span> · `
+  const row = t => `<span style="color:#3fb950">right ${t.right}</span> · `
     + `<span style="color:#f0883e">harmonic ${t.harm}</span> · `
     + `<span style="color:#8b949e">wrong ${t.wrong}</span>`;
+  const anyDet = nDet > 0;
+  const replaySeed = anyDet ? bestSeed : strongSeed;
   trialStatus.innerHTML = `${n} trials · mean S/N: fold ${mean(fold).toFixed(1)}, ampl ${mean(A).toFixed(1)}, χ² ${mean(B).toFixed(1)}`
     + `<br><strong>#1 candidate period vs true pulsar (out of ${n}):</strong>`
-    + `<br>&nbsp;&nbsp;A — amplitude sum &nbsp; ${row('', tA)}`
-    + `<br>&nbsp;&nbsp;B — χ² power sum &nbsp;&nbsp; ${row('', tB)}`;
-  btnTrials.disabled = false; btnRegen.disabled = false;
-  update();   // restore the live single-trial display
+    + `<br>&nbsp;&nbsp;A — amplitude sum &nbsp; ${row(tA)}`
+    + `<br>&nbsp;&nbsp;B — χ² power sum &nbsp;&nbsp; ${row(tB)}`
+    + `<br><strong>Detected (χ² ≥ ${DETMIN}σ): ${nDet}/${n}.</strong> ` + (anyDet
+        ? `<span style="color:#3fb950">Profile shows the best detection — folded S/N ${bestFold.toFixed(1)}, seed ${bestSeed}.</span>`
+        : `None reached ${DETMIN}σ. Profile shows the strongest candidate (χ² ${strongSnB.toFixed(1)}σ, seed ${strongSeed}) — ` + (Math.abs(strongRatio - 1) < 0.02
+            ? `<span style="color:#f0883e">the real pulsar at the right period (P/P₀ ${strongRatio.toFixed(3)}), just too weak to claim above ${DETMIN}σ.</span>`
+            : `<span style="color:#8b949e">at the wrong period (P/P₀ ${strongRatio.toFixed(2)}) — a noise fluctuation.</span>`));
+  trialBtns.forEach(b => b.disabled = false); btnRegen.disabled = false;
+  // Replay the chosen realization into the main panels so its folded profile + pdmp are on screen.
+  trialTag = (anyDet ? `best detection of ${n}` : `strongest of ${n} (not detected)`) + ` · seed ${replaySeed}`;
+  seedRng(replaySeed); update(); unseedRng();
+  trialTag = '';
 }
-btnTrials.addEventListener('click', () => runTrials(100));
+trialBtns[0].addEventListener('click', () => runTrials(25));
+trialBtns[1].addEventListener('click', () => runTrials(100));
+trialBtns[2].addEventListener('click', () => runTrials(250));
 
 // Initial render
 update();
