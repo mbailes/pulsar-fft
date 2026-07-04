@@ -314,6 +314,8 @@ const TAU = 2 * Math.PI;
 
 const N_POL = 2;          // number of polarizations summed
 const MAX_LOG2 = 20;      // FFT-length cap (2^20 samples) for responsiveness
+const INTERBIN_SUB = 4;   // sub-bin oversampling of the fundamental in the harmonic sum (interbinning)
+let _ibAsum = null, _ibPsum = null;   // reusable interbin scratch buffers (avoid re-alloc per update)
 const N_PHASE = 128;      // phase bins in the fold
 
 // Get elements
@@ -959,20 +961,30 @@ function update(collectOnly) {
   const aVals = [], bVals = [];                         // brightest-candidate S/N per fold
   const perFold = [];                                   // seek-style: best χ² candidate {m, bin, sigma} at each fold
   const perFoldA = [];                                  // best AMPLITUDE-sum candidate {m, bin, score} at each fold
-  const Asum = new Float64Array(nFreq), Psum = new Float64Array(nFreq);
-  for (let f = 1; f < nFreq; f++) { Asum[f] = zA[f]; Psum[f] = zP[f]; }
+  // --- Harmonic summing with INTERBIN resolution. A signal's j-th harmonic sits at j·f_true; reading it
+  //     at the nearest integer bin j·f (f = rounded fundamental) makes a rounding error that grows ∝ j,
+  //     so for a narrow (low-duty) pulse the high harmonics fall in the wrong bins and a sub-/harmonic can
+  //     out-score the true fundamental. Instead we give the fundamental sub-bin resolution: scan fractional
+  //     bins φ = pos/SUB and read every harmonic at its INTERPOLATED position j·φ. Keeps the same FFT. ---
+  const SUB = INTERBIN_SUB;
+  const nPos = Math.floor((nFreq - 1) * SUB) + 1;
+  if (!_ibAsum || _ibAsum.length < nPos) { _ibAsum = new Float64Array(nPos); _ibPsum = new Float64Array(nPos); }
+  const Asum = _ibAsum, Psum = _ibPsum;
+  for (let pos = 0; pos < nPos; pos++) { const x = pos / SUB, i = x | 0; if (i >= 1 && i + 1 < nFreq) { const fr = x - i; Asum[pos] = zA[i] * (1 - fr) + zA[i + 1] * fr; Psum[pos] = zP[i] * (1 - fr) + zP[i + 1] * fr; } else { Asum[pos] = 0; Psum[pos] = 0; } }
   let jDone = 1;
-  let foundFbin = 1, foundSig = -Infinity;              // fundamental bin of the best χ² (method B) candidate
-  let foundFbinA = 1, foundValA = -Infinity;            // fundamental bin of the best amplitude (method A) candidate
+  let foundFbin = 1, foundSig = -Infinity;              // fractional fundamental bin of the best χ² (method B) candidate
+  let foundFbinA = 1, foundValA = -Infinity;            // fractional fundamental bin of the best amplitude (method A) candidate
+  const poolB = [], poolA = [];                         // top-candidate pools (collectOnly) for top-N analysis
+  const posMin = Math.max(1, Math.round(fMin * SUB));
   for (const m of FOLD_SET) {
-    for (let j = jDone + 1; j <= m; j++) {           // fold in harmonics up to m
-      const fm = Math.floor((nFreq - 1) / j);
-      for (let f = 1; f <= fm; f++) { const b = j * f; Asum[f] += zA[b]; Psum[f] += zP[b]; }
+    for (let j = jDone + 1; j <= m; j++) {           // fold in harmonics up to m, each read at interpolated j·φ
+      const posMax = Math.floor((nFreq - 1) * SUB / j);
+      for (let pos = 1; pos <= posMax; pos++) { const x = j * pos / SUB, i = x | 0; if (i + 1 < nFreq) { const fr = x - i; Asum[pos] += zA[i] * (1 - fr) + zA[i + 1] * fr; Psum[pos] += zP[i] * (1 - fr) + zP[i + 1] * fr; } }
     }
     jDone = m;
-    const fm = Math.floor((nFreq - 1) / m);
-    let mA = -Infinity, mAf = fMin, mB = -Infinity, mBf = fMin;   // brightest candidate over trial f ≥ fMin
-    for (let f = fMin; f <= fm; f++) { if (Asum[f] > mA) { mA = Asum[f]; mAf = f; } if (Psum[f] > mB) { mB = Psum[f]; mBf = f; } }
+    const posMax = Math.floor((nFreq - 1) * SUB / m);
+    let mA = -Infinity, mAf = fMin, mB = -Infinity, mBf = fMin;   // brightest candidate over trial φ ≥ fMin
+    for (let pos = posMin; pos <= posMax; pos++) { if (Asum[pos] > mA) { mA = Asum[pos]; mAf = pos / SUB; } if (Psum[pos] > mB) { mB = Psum[pos]; mBf = pos / SUB; } }
     const bSig = sigmaFromChi2(m, mB), aScore = mA / Math.sqrt(m);
     aVals.push(aScore);                                       // naive amplitude z-sum (skewed → inflates)
     bVals.push(bSig);                                          // χ² equivalent-σ significance (realistic)
@@ -980,6 +992,17 @@ function update(collectOnly) {
     perFoldA.push({ m, bin: mAf, score: aScore });            // best amplitude-sum candidate at this fold
     if (bSig > foundSig) { foundSig = bSig; foundFbin = mBf; }
     if (aScore > foundValA) { foundValA = aScore; foundFbinA = mAf; }
+    if (collectOnly) {                                   // gather this fold's top-6 DISTINCT peaks (local maxima)
+      const KB = 6, tv = [], tf = [], av = [], af = [];
+      for (let pos = posMin + 1; pos < posMax; pos++) {
+        const pv = Psum[pos];
+        if (pv > Psum[pos - 1] && pv >= Psum[pos + 1] && (tv.length < KB || pv > tv[tv.length - 1])) { let i = tv.length; tv.push(pv); tf.push(pos / SUB); while (i > 0 && tv[i - 1] < tv[i]) { const a = tv[i - 1]; tv[i - 1] = tv[i]; tv[i] = a; const b = tf[i - 1]; tf[i - 1] = tf[i]; tf[i] = b; i--; } if (tv.length > KB) { tv.pop(); tf.pop(); } }
+        const avl = Asum[pos];
+        if (avl > Asum[pos - 1] && avl >= Asum[pos + 1] && (av.length < KB || avl > av[av.length - 1])) { let i = av.length; av.push(avl); af.push(pos / SUB); while (i > 0 && av[i - 1] < av[i]) { const a = av[i - 1]; av[i - 1] = av[i]; av[i] = a; const b = af[i - 1]; af[i - 1] = af[i]; af[i] = b; i--; } if (av.length > KB) { av.pop(); af.pop(); } }
+      }
+      for (let i = 0; i < tf.length; i++) poolB.push({ f: tf[i], metric: sigmaFromChi2(m, tv[i]) });
+      for (let i = 0; i < af.length; i++) poolA.push({ f: af[i], metric: av[i] / Math.sqrt(m) });
+    }
   }
   const aBest = FOLD_SET.length ? aVals.indexOf(Math.max.apply(null, aVals)) : -1;
   const bBest = FOLD_SET.length ? bVals.indexOf(Math.max.apply(null, bVals)) : -1;
@@ -996,7 +1019,7 @@ function update(collectOnly) {
   const foldTable = [];
   if (fftPass) {
     for (const m of FOLD_SET) {
-      let s = 0; for (let j = 1; j <= m; j++) { const b = j * foundFbin; if (b < nFreq) s += zP[b]; }
+      let s = 0; for (let j = 1; j <= m; j++) { const b = j * foundFbin, bi = b | 0; if (bi + 1 < nFreq) { const fr = b - bi; s += zP[bi] * (1 - fr) + zP[bi + 1] * fr; } }
       const sig = sigmaFromChi2(m, s);
       foldTable.push({ m, sigma: sig, far: farFromSigma(sig, nTrials) });
     }
@@ -1168,13 +1191,20 @@ function update(collectOnly) {
   // Headless trial mode: return the metrics, skip all drawing. Extra fields (period recovery,
   // detection state) are ignored by the in-app trials histogram but let external tests check
   // period accuracy, alias rate, and detection behaviour against the injected signal.
+  // Sift each pool into the top-5 DISTINCT-period candidates (>0.5% apart), strongest first, as ms.
+  const siftTop = (pool, K) => { pool.sort((x, y) => y.metric - x.metric); const out = [];
+    for (const c of pool) { const Pms = totalSamp / Math.max(c.f, 1) * tSamp * 1000; if (out.every(o => Math.abs(o / Pms - 1) > 0.005)) out.push(Pms); if (out.length >= K) break; } return out; };
+  const topA_ms = collectOnly ? siftTop(poolA, 5) : [], topB_ms = collectOnly ? siftTop(poolB, 5) : [];
   if (collectOnly) return { foldSN, snA, snB, aFold, bFold, oracleSN, oracleRatio,
     missA, missB, oracleDetectable, aCandFoldSN, bCandFoldSN,
     refinedPeriod, foundPeriod, foundFbin, bestDelta, detected, radioSN, nomSN,
     truePeriod: P, periodRatio: refinedPeriod / P,
-    fftPass, fftFAR, foldFAR, foldGateSigma, fftGateSigma,
+    fftPass, fftFAR, foldFAR, foldGateSigma, fftGateSigma, topA_ms, topB_ms,
     // #1-candidate period from each harmonic-summing method (nominal, before pdmp) for classification
-    candPeriodA: totalSamp / Math.max(foundFbinA, 1) * tSamp, candPeriodB: foundPeriod };
+    candPeriodA: totalSamp / Math.max(foundFbinA, 1) * tSamp, candPeriodB: foundPeriod,
+    // Raw REAL time series (first nData samples; the rest of timeSeries is zero-padding) + sampling,
+    // so an external harness can export the exact realization to PRESTO/SIGPROC for a head-to-head.
+    timeSeries, nData, tSamp, dutyFrac: duty, fluxMean: Smean, bwMHz: bw };
 
   // === Draw plots ===
 
@@ -1298,7 +1328,7 @@ function update(collectOnly) {
   const farPctTxt = FAR*100 >= 1 ? (FAR*100).toFixed(0) : (FAR*100).toPrecision(2);
   const aTxt = FOLD_SET.length ? `${FOLD_SET[aBest]} harmonics → ${aVals[aBest].toFixed(1)}` : 'n/a';
   // Stage 1 — the single best FFT candidate and the fixed 1% pre-gate.
-  html += `<strong>Best FFT candidate:</strong> bin ${foundFbin} (P = ${(foundPeriod*1000).toFixed(4)} ms), χ² <strong style="color:#39c5cf">${snB.toFixed(1)}σ</strong> summing ${bFold} harmonics; FAR = ${fmtFAR(fftFAR)} `
+  html += `<strong>Best FFT candidate:</strong> bin ${foundFbin.toFixed(2)} (P = ${(foundPeriod*1000).toFixed(4)} ms), χ² <strong style="color:#39c5cf">${snB.toFixed(1)}σ</strong> summing ${bFold} harmonics; FAR = ${fmtFAR(fftFAR)} `
         + (fftPass ? `<span style="color:#3fb950">→ clears the 1% gate → folded</span>` : `<span style="color:#f0883e">→ below the 1% gate → NOT folded</span>`) + `<br>`;
   if (fftPass) {
     const pErrPct = 100 * (refinedPeriod - P) / P;
