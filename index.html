@@ -796,13 +796,21 @@ function update(collectOnly) {
   const power = new Float64Array(nFreq);             // |X_k| (magnitude)
   for (let i = 0; i < nFreq; i++) power[i] = Math.hypot(re[i], im[i]);
 
-  // --- Detection threshold from a chosen false-alarm rate (FAR). A search examines ~nFreq trial
+  // --- Lowest trial period the search may consider. A periodicity with only a couple of cycles in
+  //     the observation is indistinguishable from red noise / DC leakage, so we require at least
+  //     MIN_CYCLES rotations: P ≤ tObs/MIN_CYCLES. A candidate at padded bin f spans f/padF real
+  //     cycles, so the search ignores every bin below fMin = MIN_CYCLES·padF. ---
+  const MIN_CYCLES = 4;
+  const fMin = Math.max(1, Math.round(MIN_CYCLES * padF));   // lowest trial FFT bin the search considers
+  const maxSearchPeriod = tObsEff / MIN_CYCLES;              // s (longest period the search will test)
+
+  // --- Detection threshold from a chosen false-alarm rate (FAR). A search examines ~nTrials trial
   //     frequencies; under pure noise each candidate's χ² significance is a one-sided Gaussian σ, so
-  //     the chance ANY of the nFreq trials exceeds x is ≈ nFreq·Φ(−x). Setting that equal to the FAR
-  //     and solving gives the threshold: DETECT_MIN = −Φ⁻¹(FAR / nFreq). More trials (longer
+  //     the chance ANY of them exceeds x is ≈ nTrials·Φ(−x). Setting that equal to the FAR and
+  //     solving gives the threshold: DETECT_MIN = −Φ⁻¹(FAR / nTrials). More trials (longer
   //     observation) ⇒ a higher σ bar — this is the look-elsewhere penalty made explicit. ---
   const FAR = parseFloat(selFar.value);               // false-alarm probability per whole search
-  const nTrials = Math.max(nFreq, 2);
+  const nTrials = Math.max(nFreq - fMin, 2);          // trial frequencies actually searched (f ≥ fMin)
   const DETECT_MIN = -ltqnorm(FAR / nTrials);         // equivalent-Gaussian σ threshold
   vFar.textContent = `${(FAR * 100 >= 1 ? (FAR*100).toFixed(0) : (FAR*100).toPrecision(2))}% → ${DETECT_MIN.toFixed(2)}σ (${nTrials.toLocaleString()} trials)`;
 
@@ -861,8 +869,8 @@ function update(collectOnly) {
     }
     jDone = m;
     const fm = Math.floor((nFreq - 1) / m);
-    let mA = -Infinity, mAf = 1, mB = -Infinity, mBf = 1;      // brightest candidate over all trial f
-    for (let f = 1; f <= fm; f++) { if (Asum[f] > mA) { mA = Asum[f]; mAf = f; } if (Psum[f] > mB) { mB = Psum[f]; mBf = f; } }
+    let mA = -Infinity, mAf = fMin, mB = -Infinity, mBf = fMin;   // brightest candidate over trial f ≥ fMin
+    for (let f = fMin; f <= fm; f++) { if (Asum[f] > mA) { mA = Asum[f]; mAf = f; } if (Psum[f] > mB) { mB = Psum[f]; mBf = f; } }
     const bSig = sigmaFromChi2(m, mB), aScore = mA / Math.sqrt(m);
     aVals.push(aScore);                                       // naive amplitude z-sum (skewed → inflates)
     bVals.push(bSig);                                          // χ² equivalent-σ significance (realistic)
@@ -1081,6 +1089,7 @@ function update(collectOnly) {
   let html = '';
   html += `<strong>System:</strong> SEFD = T<sub>sys</sub>/G = ${SEFD.toFixed(1)} Jy; per-sample noise σ = ${sigma_mJy.toFixed(1)} mJy (n<sub>pol</sub>=${N_POL}, Δν=${bw} MHz, t<sub>samp</sub>=${tSampUs} µs)<br>`;
   html += `<strong>Observation:</strong> ${tObsEff.toFixed(2)} s = 2<sup>${log2N}</sup> = ${nData.toLocaleString()} real samples${padF > 1 ? `, zero-padded ${padF}× → 2<sup>${Math.log2(totalSamp)}</sup>-pt FFT (interbinned, anti-scalloping)` : ' (no padding — FFT at the length ceiling)'}; ${nPulses.toFixed(0)} pulses; ${Lf.toFixed(2)} samples/period<br>`;
+  html += `<strong>Search range:</strong> only periods P ≤ t<sub>obs</sub>/${MIN_CYCLES} = <strong>${maxSearchPeriod < 1 ? (maxSearchPeriod*1000).toFixed(1)+' ms' : maxSearchPeriod.toFixed(3)+' s'}</strong> are tested (≥ ${MIN_CYCLES} rotations needed to trust a periodicity); ${(period*1e-3) > maxSearchPeriod ? '<span style="color:#f0883e">the injected period is LONGER than this — the search cannot find it</span>' : `${nTrials.toLocaleString()} trial frequencies searched`}<br>`;
   html += `<strong>Radiometer S/N (expected):</strong> <strong style="color:#58a6ff">${radioSN.toFixed(1)}</strong> = (S<sub>mean</sub>/SEFD)·√(n<sub>pol</sub>·Δν·t<sub>obs</sub>)·√((1−δ)/δ)<br>`;
   const pErrPct = 100 * (refinedPeriod - P) / P;
   const ratio = refinedPeriod / P;                       // found-period : true-period (teaching aid only)
