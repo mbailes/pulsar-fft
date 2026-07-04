@@ -243,7 +243,10 @@ canvas {
 
   <div id="seek-panel" style="margin:14px 0; padding:12px 14px; background:#0d1117; border:1px solid #30363d; border-radius:8px; overflow-x:auto">
     <div style="color:#8b949e; font-size:0.85rem; margin-bottom:6px">Harmonic-fold search (seek-style) — best candidate period &amp; S/N as harmonics are summed 1→32 (winning fold highlighted)</div>
+    <div style="color:#39c5cf; font-size:0.8rem; margin-bottom:3px">χ² power sum (optimal — the calibrated detection statistic):</div>
     <div id="seek-table"></div>
+    <div style="color:#d2a8ff; font-size:0.8rem; margin:10px 0 3px">Amplitude sum (sub-optimal — the Rayleigh-skewed statistic, reads high; shown for contrast):</div>
+    <div id="seek-table-a"></div>
   </div>
 
   <div class="explanation">
@@ -280,7 +283,7 @@ canvas {
       </div>
     </div>
     <div class="plot-container" style="margin-top:14px">
-      <div class="plot-title">Folded S/N vs FFT harmonic-sum S/N (each trial; dashed line is y = x)</div>
+      <div class="plot-title">Folded S/N vs FFT harmonic-sum S/N — folded trials only; cyan = χ², purple = amplitude sum; above y=x means folding gained S/N</div>
       <canvas id="cv-scatter"></canvas>
     </div>
     <div style="display:flex; gap:14px; flex-wrap:wrap; margin-top:14px">
@@ -315,6 +318,7 @@ const cvTime = document.getElementById('cv-time');
 const cvFft = document.getElementById('cv-fft');
 const cvSubs = document.getElementById('cv-subs');
 const seekTable = document.getElementById('seek-table');
+const seekTableA = document.getElementById('seek-table-a');
 const cvSn = document.getElementById('cv-sn');
 const cvSn2 = document.getElementById('cv-sn2');
 const harmonicInfo = document.getElementById('harmonic-info');
@@ -699,28 +703,37 @@ function drawHistogram(canvas, values, color, xlabel) {
   ctx.fillStyle = '#8b949e'; ctx.textAlign = 'right'; ctx.fillText(xlabel || 'S/N', ml + pw, mt + ph + 14);
 }
 
-function drawScatter(canvas, foldY, aX, bX) {
+// FOLDED trials only (χ² FFT S/N on x, folded S/N on y). The vertical line is the 1% FFT pre-gate
+// (every plotted point is right of it — that's why they were folded); the horizontal line is the
+// fold-winner FAR bar. Points above it (green) are winners; below (grey) folded up to noise.
+function drawScatter(canvas, foldY, aX, bX, foldGate) {
   const pr = window.devicePixelRatio || 1, W = canvas.clientWidth, H = canvas.clientHeight;
   canvas.width = W * pr; canvas.height = H * pr; const ctx = canvas.getContext('2d'); ctx.scale(pr, pr);
   const ml = 50, mr = 12, mt = 10, mb = 34, pw = W - ml - mr, ph = H - mt - mb;
   ctx.fillStyle = '#0d1117'; ctx.fillRect(0, 0, W, H);
-  if (!foldY.length) return;
-  const all = foldY.concat(aX, bX);            // shared range so the y=x line is meaningful
-  let lo = Math.min.apply(null, all), hi = Math.max.apply(null, all);
-  lo = Math.min(0, lo); if (lo === hi) hi = lo + 1; const pad = (hi - lo) * 0.05; hi += pad;
+  if (!foldY.length) { ctx.fillStyle = '#8b949e'; ctx.font = '12px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('no trial cleared the 1% FFT gate — nothing folded', W / 2, H / 2); return; }
+  const all = foldY.concat(aX, bX, [foldGate]);
+  let lo = 0, hi = Math.max.apply(null, all); if (lo === hi) hi = lo + 1; hi += (hi - lo) * 0.05;
   const toX = v => ml + (v - lo) / (hi - lo) * pw, toY = v => mt + (1 - (v - lo) / (hi - lo)) * ph;
-  // y=x reference line
-  ctx.strokeStyle = '#3a4a5a'; ctx.setLineDash([4, 4]); ctx.beginPath(); ctx.moveTo(toX(lo), toY(lo)); ctx.lineTo(toX(hi), toY(hi)); ctx.stroke(); ctx.setLineDash([]);
-  // x = FFT harmonic-sum S/N, y = folded S/N
-  const pts = (xarr, col) => { ctx.fillStyle = col; for (let i = 0; i < foldY.length; i++) { ctx.beginPath(); ctx.arc(toX(xarr[i]), toY(foldY[i]), 2.5, 0, TAU); ctx.fill(); } };
-  pts(aX, '#d2a8ff'); pts(bX, '#39c5cf');
+  // y=x equality reference: folded S/N vs FFT S/N — points above the line gained from folding
+  ctx.setLineDash([5, 4]); ctx.strokeStyle = '#5a6470';
+  ctx.beginPath(); ctx.moveTo(toX(lo), toY(lo)); ctx.lineTo(toX(hi), toY(hi)); ctx.stroke();
+  // horizontal fold-winner FAR bar
+  ctx.strokeStyle = '#2ea043'; ctx.beginPath(); ctx.moveTo(ml, toY(foldGate)); ctx.lineTo(ml + pw, toY(foldGate)); ctx.stroke();
+  ctx.setLineDash([]);
+  const pts = (X, col) => { ctx.fillStyle = col; for (let i = 0; i < foldY.length; i++) { ctx.beginPath(); ctx.arc(toX(X[i]), toY(foldY[i]), 2.5, 0, TAU); ctx.fill(); } };
+  pts(aX, '#d2a8ff');   // amplitude harmonic sum (mis-calibrated) — purple
+  pts(bX, '#39c5cf');   // χ² harmonic sum — cyan
   ctx.strokeStyle = '#3a4a5a'; ctx.beginPath(); ctx.moveTo(ml, mt); ctx.lineTo(ml, mt + ph); ctx.lineTo(ml + pw, mt + ph); ctx.stroke();
   ctx.fillStyle = '#8b949e'; ctx.font = '10px sans-serif'; ctx.textAlign = 'center';
   for (let j = 0; j <= 4; j++) { const v = lo + j * (hi - lo) / 4; ctx.fillText(v.toFixed(1), ml + j * pw / 4, mt + ph + 14); ctx.textAlign = 'right'; ctx.fillText(v.toFixed(1), ml - 5, toY(v) + 4); ctx.textAlign = 'center'; }
   ctx.fillStyle = '#8b949e'; ctx.font = '12px sans-serif'; ctx.fillText('FFT harmonic-sum S/N', ml + pw / 2, H - 4);
   ctx.save(); ctx.translate(13, mt + ph / 2); ctx.rotate(-Math.PI / 2); ctx.fillText('Folded S/N', 0, 0); ctx.restore();
-  ctx.textAlign = 'left'; ctx.fillStyle = '#d2a8ff'; ctx.fillText('● A naive (ampl)', ml + 8, mt + 12);
-  ctx.fillStyle = '#39c5cf'; ctx.fillText('● B better (χ²)', ml + 8, mt + 26);
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#39c5cf'; ctx.fillText('● χ²', ml + 8, mt + 12);
+  ctx.fillStyle = '#d2a8ff'; ctx.fillText('● amplitude', ml + 42, mt + 12);
+  ctx.fillStyle = '#2ea043'; ctx.fillText('— fold-winner bar', ml + 8, mt + 26);
+  ctx.fillStyle = '#5a6470'; ctx.fillText('-- y = x', ml + 8, mt + 40);
 }
 
 // Scatter of per-trial peak S/N (y) vs the harmonic number the trial peaked at (x, jittered).
@@ -885,7 +898,8 @@ function update(collectOnly) {
   //     candidate — the look-elsewhere floor set by the number of trial frequencies. ---
   const FOLD_SET = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32].filter(m => m < nFreq / 2);
   const aVals = [], bVals = [];                         // brightest-candidate S/N per fold
-  const perFold = [];                                   // seek-style: best candidate {m, bin, sigma} at each fold
+  const perFold = [];                                   // seek-style: best χ² candidate {m, bin, sigma} at each fold
+  const perFoldA = [];                                  // best AMPLITUDE-sum candidate {m, bin, score} at each fold
   const Asum = new Float64Array(nFreq), Psum = new Float64Array(nFreq);
   for (let f = 1; f < nFreq; f++) { Asum[f] = zA[f]; Psum[f] = zP[f]; }
   let jDone = 1;
@@ -903,7 +917,8 @@ function update(collectOnly) {
     const bSig = sigmaFromChi2(m, mB), aScore = mA / Math.sqrt(m);
     aVals.push(aScore);                                       // naive amplitude z-sum (skewed → inflates)
     bVals.push(bSig);                                          // χ² equivalent-σ significance (realistic)
-    perFold.push({ m, bin: mBf, sigma: bSig });               // best candidate at this fold (seek-style)
+    perFold.push({ m, bin: mBf, sigma: bSig });               // best χ² candidate at this fold (seek-style)
+    perFoldA.push({ m, bin: mAf, score: aScore });            // best amplitude-sum candidate at this fold
     if (bSig > foundSig) { foundSig = bSig; foundFbin = mBf; }
     if (aScore > foundValA) { foundValA = aScore; foundFbinA = mAf; }
   }
@@ -1104,22 +1119,26 @@ function update(collectOnly) {
     { xOf: s => centreX(s) + hiOff, color: '#f778ba' },
   ]);
 
-  // 1c. seek-style harmonic-fold table: best candidate period & S/N at 1,2,4,8,16,32 harmonics.
-  {
-    const seekFolds = perFold.filter(p => (p.m & (p.m - 1)) === 0);   // powers of two only
-    const bestSeekM = seekFolds.length ? seekFolds.reduce((a, b) => b.sigma > a.sigma ? b : a).m : -1;
-    const cell = (s, ex = '') => `<td style="padding:3px 12px;border:1px solid #21262d;${ex}">${s}</td>`;
-    const hi = m => m === bestSeekM ? 'background:#12261a;' : '';
-    let t = '<table style="border-collapse:collapse;font-size:0.82rem;white-space:nowrap">';
+  // 1c. seek-style harmonic-fold tables: best candidate period & S/N at 1,2,4,8,16,32 harmonics, for
+  //     BOTH the optimal χ² power sum and the sub-optimal amplitude sum (same candidates, different stat).
+  const renderSeek = (folds, snKey, snLabel, target) => {
+    const bestM = folds.length ? folds.reduce((a, b) => b[snKey] > a[snKey] ? b : a).m : -1;
+    const cell = (s, ex = '') => `<td style="padding:3px 10px;border:1px solid #21262d;${ex}">${s}</td>`;
+    const hi = m => m === bestM ? 'background:#12261a;' : '';
+    let t = '<table style="border-collapse:collapse;font-size:0.8rem;white-space:nowrap">';
     t += '<tr style="color:#58a6ff">' + cell('Harmonics summed');
-    for (const p of seekFolds) t += cell(p.m === 1 ? '1 (fund)' : p.m, hi(p.m) + (p.m === bestSeekM ? 'color:#3fb950;' : ''));
+    for (const p of folds) t += cell(p.m === 1 ? '1 (fund)' : p.m, hi(p.m) + (p.m === bestM ? 'color:#3fb950;' : ''));
     t += '</tr><tr style="color:#c9d1d9">' + cell('Best period (ms)');
-    for (const p of seekFolds) t += cell((totalSamp / Math.max(p.bin, 1) * tSamp * 1000).toFixed(4), hi(p.m));
-    t += '</tr><tr style="color:#c9d1d9">' + cell('Best S/N (σ)');
-    for (const p of seekFolds) t += cell(p.sigma.toFixed(2), hi(p.m) + (p.m === bestSeekM ? 'color:#3fb950;font-weight:600;' : (p.sigma >= fftGateSigma ? '' : 'color:#8b949e;')));
+    for (const p of folds) t += cell((totalSamp / Math.max(p.bin, 1) * tSamp * 1000).toFixed(4), hi(p.m));
+    t += `</tr><tr style="color:#c9d1d9">` + cell(snLabel);
+    for (const p of folds) t += cell(p[snKey].toFixed(2), hi(p.m) + (p.m === bestM ? 'color:#3fb950;font-weight:600;' : ''));
+    t += '</tr><tr style="color:#8b949e">' + cell('FAR (' + nTrials.toLocaleString() + ' trials)');
+    for (const p of folds) t += cell(fmtFAR(farFromSigma(p[snKey], nTrials)), hi(p.m));
     t += '</tr></table>';
-    seekTable.innerHTML = t;
-  }
+    target.innerHTML = t;
+  };
+  renderSeek(perFold, 'sigma', 'Best S/N (σ)', seekTable);
+  renderSeek(perFoldA, 'score', 'Best S/N (ampl)', seekTableA);
 
   // 2. Raw time series (first few periods) in mJy — single pulses are buried in the noise
   const showSamp = Math.min(nData, Math.max(Math.round(8 * Lf), 400));
@@ -1141,6 +1160,8 @@ function update(collectOnly) {
     xLabel: 'Frequency  f / f₀  (harmonic number)',
     yLabel: '|FFT| / rms',
     color: '#e3b341', filled: true, envelope: true,
+    markers: Array.from({ length: N_SHOW }, (_, k) => k + 1),   // true harmonics at integer f/f₀
+    markerColor: '#f85149',
     xMin: 0, xMax: maxBinShow / f0_bin,
     yMin: 0, yMax: 1.05 * (specMax || 1),
   });
@@ -1239,6 +1260,8 @@ async function runTrials(n) {
   const base = (Math.floor(Math.random() * 0x7fffffff)) >>> 0;
   let bestFold = -Infinity, bestSeed = base, nDet = 0, nFolded = 0;   // winners; FFT candidates that got folded
   let strongSnB = -Infinity, strongSeed = base, strongRatio = 1;      // strongest near-miss if nothing detected
+  const sFold = [], sA = [], sB = [];                 // scatter: FOLDED trials only (unfolded have no folded S/N)
+  let fftGate = 0, foldGate = 0;
   for (let t = 0; t < n; t++) {
     const seed = (base + t) >>> 0;
     seedRng(seed);
@@ -1246,7 +1269,8 @@ async function runTrials(n) {
     fold.push(r.foldSN); A.push(r.snA); B.push(r.snB); aF.push(r.aFold); bF.push(r.bFold);
     classify(r.candPeriodA, r.truePeriod, tA);    // method A — amplitude harmonic sum
     classify(r.candPeriodB, r.truePeriod, tB);    // method B — χ² power harmonic sum (drives the fold)
-    if (r.fftPass) nFolded++;                       // FFT candidate cleared the 1% gate → was folded
+    fftGate = r.fftGateSigma; foldGate = r.foldGateSigma;
+    if (r.fftPass) { nFolded++; sA.push(r.snA); sB.push(r.snB); sFold.push(r.foldSN); }   // only folded trials go on the scatter
     // Winner = detected (folded S/N clears the FAR bar). An undetected fold is an optimised noise
     // fluctuation, so only detections may become the displayed best.
     if (r.detected) { nDet++; if (r.foldSN > bestFold) { bestFold = r.foldSN; bestSeed = seed; } }
@@ -1257,7 +1281,7 @@ async function runTrials(n) {
   drawHistogram(cvH1, fold, '#3fb950', 'Folded S/N');
   drawHistogram(cvH2, A, '#d2a8ff', 'FFT S/N (naive)');
   drawHistogram(cvH3, B, '#39c5cf', 'FFT S/N (better)');
-  drawScatter(cvScatter, fold, A, B);
+  drawScatter(cvScatter, sFold, sA, sB, foldGate);
   drawFoldScatter(cvFA, aF, A, '#d2a8ff');
   drawFoldScatter(cvFB, bF, B, '#39c5cf');
   const mean = a => a.reduce((x, y) => x + y, 0) / a.length;
