@@ -287,7 +287,7 @@ canvas {
       <canvas id="cv-scatter"></canvas>
     </div>
     <div class="plot-container" style="margin-top:14px">
-      <div class="plot-title">Oracle (known-period) folded S/N vs each method's peak FFT S/N — every trial; cyan = χ², purple = amplitude. Right of the green bar = detectable by folding; highlighted points (orange χ², magenta amplitude) = detectable but the method's #1 candidate was at the WRONG period → a MISS</div>
+      <div class="plot-title">Oracle (known-period) folded S/N vs each method's peak FFT S/N — every trial; cyan = χ², purple = amplitude. Right of the green bar = detectable by folding; highlighted points (orange χ², magenta amplitude) = detectable but folding the method's #1 candidate fails to recover it above the FAR at an injection-related period → a MISS</div>
       <canvas id="cv-oscatter"></canvas>
     </div>
     <div style="display:flex; gap:14px; flex-wrap:wrap; margin-top:14px">
@@ -753,11 +753,10 @@ function drawScatter(canvas, foldY, aX, bX, foldGate) {
 // Oracle scatter: x = folded S/N at the KNOWN period (the achievable ceiling), y = each method's
 // peak FFT harmonic-sum S/N. The vertical bar marks "detectable by a known-ephemeris fold"
 // (foldGate); the horizontal bar is the 1% FFT gate, kept only as a reference for where the search
-// decides to fold. A MISS (calibration-free) = the pulse is oracle-detectable yet the method's #1
-// candidate is NOT at the true period, so folding where it points wouldn't recover the pulsar. Such
-// points are highlighted orange — note some sit ABOVE the fold gate: the (mis-calibrated) amplitude
-// sum happily clears the gate at a WRONG, noise period. Returns {a,b} miss counts. Every trial plots.
-function drawOracleScatter(canvas, oracleX, aY, bY, aRight, bRight, fftGate, foldGate) {
+// decides to fold. Miss booleans are precomputed in update() by the ACTUAL folded outcome (fold the
+// method's #1 candidate → clears the FAR bar AND at an injection-related period, else a miss).
+// Amplitude misses are highlighted magenta, χ² misses orange. Returns {a,b} miss counts.
+function drawOracleScatter(canvas, oracleX, aY, bY, aMiss, bMiss, fftGate, foldGate) {
   const pr = window.devicePixelRatio || 1, W = canvas.clientWidth, H = canvas.clientHeight;
   canvas.width = W * pr; canvas.height = H * pr; const ctx = canvas.getContext('2d'); ctx.scale(pr, pr);
   const ml = 50, mr = 12, mt = 10, mb = 34, pw = W - ml - mr, ph = H - mt - mb;
@@ -775,17 +774,15 @@ function drawOracleScatter(canvas, oracleX, aY, bY, aRight, bRight, fftGate, fol
   // highlighted magenta, χ² misses orange, so the two methods' failures are distinguishable.
   let nMissA = 0;
   for (let i = 0; i < oracleX.length; i++) {                                                          // amplitude
-    const miss = oracleX[i] >= foldGate && !aRight[i];
-    if (miss) nMissA++;
-    ctx.fillStyle = miss ? '#ff6ac1' : '#d2a8ff';
-    ctx.beginPath(); ctx.arc(toX(oracleX[i]), toY(aY[i]), miss ? 3.2 : 2.3, 0, TAU); ctx.fill();
+    if (aMiss[i]) nMissA++;
+    ctx.fillStyle = aMiss[i] ? '#ff6ac1' : '#d2a8ff';
+    ctx.beginPath(); ctx.arc(toX(oracleX[i]), toY(aY[i]), aMiss[i] ? 3.2 : 2.3, 0, TAU); ctx.fill();
   }
   let nMissB = 0;
   for (let i = 0; i < oracleX.length; i++) {                                                          // χ²
-    const miss = oracleX[i] >= foldGate && !bRight[i];
-    if (miss) nMissB++;
-    ctx.fillStyle = miss ? '#f0883e' : '#39c5cf';
-    ctx.beginPath(); ctx.arc(toX(oracleX[i]), toY(bY[i]), miss ? 3.2 : 2.3, 0, TAU); ctx.fill();
+    if (bMiss[i]) nMissB++;
+    ctx.fillStyle = bMiss[i] ? '#f0883e' : '#39c5cf';
+    ctx.beginPath(); ctx.arc(toX(oracleX[i]), toY(bY[i]), bMiss[i] ? 3.2 : 2.3, 0, TAU); ctx.fill();
   }
   ctx.strokeStyle = '#3a4a5a'; ctx.beginPath(); ctx.moveTo(ml, mt); ctx.lineTo(ml, mt + ph); ctx.lineTo(ml + pw, mt + ph); ctx.stroke();
   ctx.fillStyle = '#8b949e'; ctx.font = '10px sans-serif'; ctx.textAlign = 'center';
@@ -1137,6 +1134,29 @@ function update(collectOnly) {
   const oracleSN = oracle ? oracle.foldSN : 0;
   const oracleRatio = oracleSN > 1e-6 ? Math.min(snB / oracleSN, 3) : 0;   // χ² recovery fraction (capped for display)
 
+  // Miss test (by the ACTUAL folded outcome). A pulse is RECOVERED by a method when folding that
+  // method's #1 candidate at its own period (a) clears the fold FAR bar AND (b) lands on a period
+  // actually related to the injection — the true period or a ½×,2×,3×,4×… harmonic. A miss is any
+  // oracle-detectable pulse that is NOT recovered. Condition (b) is the guard: a fold at a spurious,
+  // unrelated period will clear the bar at the FAR rate purely by noise, and without (b) that would be
+  // mis-scored as a "detection". Requiring the period to be injection-related rejects those flukes.
+  // Only evaluated for oracle-detectable trials, so the extra folds stay cheap.
+  const oracleDetectable = oracleSN >= foldGateSigma;
+  const relatedToInjection = p => { const r = p / P; return Math.abs(r - 1) < 0.02 || [2, 3, 4, 0.5, 1/3, 0.25].some(k => Math.abs(r - k) < 0.02 * k); };
+  const aCandLf = totalSamp / Math.max(foundFbinA, 1);
+  let missA = false, missB = false, aCandFoldSN = 0, bCandFoldSN = 0;
+  const bCandRelated = relatedToInjection(foundPeriod), aCandRelated = relatedToInjection(aCandLf * tSamp);
+  if (oracleDetectable) {
+    // Recovery needs BOTH an injection-related period AND a fold above the bar. An unrelated period can
+    // never recover the injected pulsar, so we only spend a fold when the period is related — cheap,
+    // and it means an unrelated candidate is an immediate miss (no fold, no chance of a noise fluke
+    // being mis-scored as a detection).
+    bCandFoldSN = fftPass ? foldSN : (bCandRelated ? foldAndPdmp(foundLf).foldSN : 0);
+    aCandFoldSN = aCandRelated ? foldAndPdmp(aCandLf).foldSN : 0;
+    missB = !(bCandRelated && bCandFoldSN >= foldGateSigma);
+    missA = !(aCandRelated && aCandFoldSN >= foldGateSigma);
+  }
+
   // Winner decision: the FOLDED S/N (not the FFT S/N) decides if the candidate is real, judged at
   // the selected FAR over the phase search. Only a candidate that was folded can win.
   const foldFAR = fftPass ? farFromSigma(foldSN, N_FOLD_TRIALS) : 1;
@@ -1149,6 +1169,7 @@ function update(collectOnly) {
   // detection state) are ignored by the in-app trials histogram but let external tests check
   // period accuracy, alias rate, and detection behaviour against the injected signal.
   if (collectOnly) return { foldSN, snA, snB, aFold, bFold, oracleSN, oracleRatio,
+    missA, missB, oracleDetectable, aCandFoldSN, bCandFoldSN,
     refinedPeriod, foundPeriod, foundFbin, bestDelta, detected, radioSN, nomSN,
     truePeriod: P, periodRatio: refinedPeriod / P,
     fftPass, fftFAR, foldFAR, foldGateSigma, fftGateSigma,
@@ -1299,14 +1320,13 @@ function update(collectOnly) {
     html += `<span style="color:#8b949e">Nothing folded — raise the flux, bandwidth, or observation length until an FFT candidate beats the 1% gate.</span><br>`;
   }
   {
-    const oracleDetectable = oracleSN >= foldGateSigma;
-    const missed = oracleDetectable && !detected;
     html += `<strong>Oracle fold (known period — the ceiling):</strong> folding at the TRUE period gives `
           + `<strong style="color:${oracleDetectable ? '#3fb950' : '#8b949e'}">${oracleSN.toFixed(1)}σ</strong> `
           + `(FAR ${fmtFAR(farFromSigma(oracleSN, N_FOLD_TRIALS))}) — `
-          + (missed ? `<span style="color:#f0883e">detectable, but the blind search did NOT fold it → a MISS</span>`
-             : detected ? `<span style="color:#3fb950">and the blind search recovered it too</span>`
-             : `<span style="color:#8b949e">not significant either — genuinely too weak to detect</span>`) + `<br>`;
+          + (!oracleDetectable ? `<span style="color:#8b949e">not significant even at the true period — genuinely too weak to detect</span>`
+             : !missB ? `<span style="color:#3fb950">and folding the search's #1 candidate recovers it too (${bCandFoldSN.toFixed(1)}σ)</span>`
+             : !bCandRelated ? `<span style="color:#f0883e">detectable, but the #1 candidate (P = ${(foundPeriod*1000).toFixed(4)} ms) is at a period UNRELATED to the injection — folding it can't recover the pulsar → a MISS</span>`
+             : `<span style="color:#f0883e">detectable, but folding the #1 candidate (P = ${(foundPeriod*1000).toFixed(4)} ms) recovers only ${bCandFoldSN.toFixed(1)}σ — below the FAR bar → a MISS</span>`) + `<br>`;
   }
   html += `<span style="color:#8b949e">(Amplitude sum, for contrast only: ${aTxt}. Detection is decided by the FOLDED S/N, as in a real survey — not the FFT S/N.)</span><br><br>`;
   html += '<span style="color:#8b949e">Injected signal at the true period (for reference — the search does not use this):</span><br>';
@@ -1357,7 +1377,7 @@ async function runTrials(n) {
   let strongSnB = -Infinity, strongSeed = base, strongRatio = 1;      // strongest near-miss if nothing detected
   const sFold = [], sA = [], sB = [];                 // scatter: FOLDED trials only (unfolded have no folded S/N)
   const oS = [], oR = [];                             // oracle: folded S/N at the true period, + χ² recovery fraction
-  const oaRight = [], obRight = [];                   // per trial: did each method's #1 candidate land on the true period?
+  const oMissA = [], oMissB = [];                     // per trial: oracle-detectable but folding this method's #1 candidate recovers nothing above the FAR?
   let fftGate = 0, foldGate = 0;
   for (let t = 0; t < n; t++) {
     const seed = (base + t) >>> 0;
@@ -1365,8 +1385,7 @@ async function runTrials(n) {
     const r = update(true);
     fold.push(r.foldSN); A.push(r.snA); B.push(r.snB); aF.push(r.aFold); bF.push(r.bFold);
     oS.push(r.oracleSN); oR.push(r.oracleRatio);
-    oaRight.push(Math.abs(r.candPeriodA / r.truePeriod - 1) < 0.02);   // #1 candidate at the true period?
-    obRight.push(Math.abs(r.candPeriodB / r.truePeriod - 1) < 0.02);
+    oMissA.push(r.missA); oMissB.push(r.missB);   // detectable but folding this method's #1 candidate recovers nothing above the FAR
     classify(r.candPeriodA, r.truePeriod, tA);    // method A — amplitude harmonic sum
     classify(r.candPeriodB, r.truePeriod, tB);    // method B — χ² power harmonic sum (drives the fold)
     fftGate = r.fftGateSigma; foldGate = r.foldGateSigma;
@@ -1382,7 +1401,7 @@ async function runTrials(n) {
   drawHistogram(cvH2, A, '#d2a8ff', 'FFT S/N (naive)');
   drawHistogram(cvH3, B, '#39c5cf', 'FFT S/N (better)');
   drawScatter(cvScatter, sFold, sA, sB, foldGate);
-  const miss = drawOracleScatter(cvOScatter, oS, A, B, oaRight, obRight, fftGate, foldGate);
+  const miss = drawOracleScatter(cvOScatter, oS, A, B, oMissA, oMissB, fftGate, foldGate);
   drawHistogram(cvOracle, oS, '#f0c674', 'Oracle folded S/N');
   drawHistogram(cvRatio, oR, '#8ac6d1', 'χ² S/N ÷ oracle');
   drawFoldScatter(cvFA, aF, A, '#d2a8ff');
@@ -1397,7 +1416,7 @@ async function runTrials(n) {
     + `<br><strong>#1 candidate period vs true pulsar (out of ${n}):</strong>`
     + `<br>&nbsp;&nbsp;A — amplitude sum &nbsp; ${row(tA)}`
     + `<br>&nbsp;&nbsp;B — χ² power sum &nbsp;&nbsp; ${row(tB)}`
-    + `<br><strong>Oracle check</strong> (detectable by folding at the true period, but the method's #1 candidate was at the WRONG period → folding there recovers nothing): `
+    + `<br><strong>Oracle check</strong> (detectable by folding at the true period, but folding the method's #1 candidate fails to recover it above the FAR at an injection-related period): `
     + `B χ² <span style="color:#f0883e">${miss.b}/${n}</span> · A amplitude <span style="color:#ff6ac1">${miss.a}/${n}</span> — S/N left on the table.`
     + `<br><strong>FFT-flagged (&gt;1% gate): ${nFolded}/${n} folded → winners: ${nDet}/${n}.</strong> ` + (anyDet
         ? `<span style="color:#3fb950">Profile shows the best winner — folded S/N ${bestFold.toFixed(1)}, seed ${bestSeed}.</span>`
