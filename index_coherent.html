@@ -934,6 +934,13 @@ function update(collectOnly) {
   const MIN_CYCLES = 4;
   const fMin = Math.max(1, Math.round(MIN_CYCLES * padF));   // lowest trial FFT bin the search considers
   const maxSearchPeriod = tObsEff / MIN_CYCLES;              // s (longest period the search will test)
+  // --- Highest trial frequency: ignore any FUNDAMENTAL with period below MIN_PERIOD. Sub-millisecond
+  //     "candidates" are high-harmonic aliases and noise spikes, never the pulsars we search for here,
+  //     and only pollute the candidate list. A fundamental at padded bin f has period
+  //     P = 2·nFreq·tSamp / f, so P ≥ MIN_PERIOD ⇔ f ≤ fMax. (Harmonics of an accepted fundamental may
+  //     still lie above fMax — only the fundamental is floored.) ---
+  const MIN_PERIOD = 1e-3;                                   // s — drop any candidate fundamental below 1 ms
+  const fMax = Math.min(nFreq - 1, Math.floor(2 * nFreq * tSamp / MIN_PERIOD));   // highest fundamental bin searched
 
   // --- Two-stage detection, as a real survey works ---
   //   (1) FFT PRE-GATE: the blind harmonic search examines ~nTrials trial frequencies; under noise
@@ -943,7 +950,7 @@ function update(collectOnly) {
   //       is over pulse phase (≈ N_PHASE trials), so at the SELECTED FAR the bar is
   //       foldGateSigma = −Φ⁻¹(FAR/N_PHASE). More FFT trials ⇒ higher fold-gate — look-elsewhere. ---
   const FAR = parseFloat(selFar.value);               // selected false-alarm rate, applied to the folded S/N
-  const nTrials = Math.max(nFreq - fMin, 2);          // FFT trial frequencies actually searched (f ≥ fMin)
+  const nTrials = Math.max(fMax - fMin, 2);           // FFT trial frequencies searched (fMin ≤ f ≤ fMax) — look-elsewhere shrinks with the 1 ms floor
   const FFT_GATE_FAR = 0.01;                          // fixed pre-filter: fold only if the FFT candidate beats 1%
   const fftGateSigma = -ltqnorm(FFT_GATE_FAR / nTrials);
   const N_FOLD_TRIALS = N_PHASE;                      // phase-search trial budget for the folded S/N's FAR
@@ -1017,8 +1024,9 @@ function update(collectOnly) {
     }
     jDone = m;
     const posMax = Math.floor((nFreq - 1) * SUB / m);
-    let mA = -Infinity, mAf = fMin, mB = -Infinity, mBf = fMin;   // brightest candidate over trial φ ≥ fMin
-    for (let pos = posMin; pos <= posMax; pos++) { if (Asum[pos] > mA) { mA = Asum[pos]; mAf = pos / SUB; } if (Psum[pos] > mB) { mB = Psum[pos]; mBf = pos / SUB; } }
+    const posMaxF = Math.min(posMax, Math.floor(fMax * SUB));    // cap the FUNDAMENTAL at fMax (period ≥ MIN_PERIOD)
+    let mA = -Infinity, mAf = fMin, mB = -Infinity, mBf = fMin;   // brightest candidate over fMin ≤ φ ≤ fMax
+    for (let pos = posMin; pos <= posMaxF; pos++) { if (Asum[pos] > mA) { mA = Asum[pos]; mAf = pos / SUB; } if (Psum[pos] > mB) { mB = Psum[pos]; mBf = pos / SUB; } }
     const bSig = sigmaFromChi2(m, mB), aScore = mA / Math.sqrt(m);
     aVals.push(aScore);                                       // naive amplitude z-sum (skewed → inflates)
     bVals.push(bSig);                                          // χ² equivalent-σ significance (realistic)
@@ -1028,7 +1036,7 @@ function update(collectOnly) {
     if (aScore > foundValA) { foundValA = aScore; foundFbinA = mAf; }
     if (collectOnly || COH_RERANK) {                     // gather this fold's top-6 DISTINCT peaks (local maxima)
       const KB = 6, tv = [], tf = [], av = [], af = [];
-      for (let pos = posMin + 1; pos < posMax; pos++) {
+      for (let pos = posMin + 1; pos < posMaxF; pos++) {
         const pv = Psum[pos];
         if (pv > Psum[pos - 1] && pv >= Psum[pos + 1] && (tv.length < KB || pv > tv[tv.length - 1])) { let i = tv.length; tv.push(pv); tf.push(pos / SUB); while (i > 0 && tv[i - 1] < tv[i]) { const a = tv[i - 1]; tv[i - 1] = tv[i]; tv[i] = a; const b = tf[i - 1]; tf[i - 1] = tf[i]; tf[i] = b; i--; } if (tv.length > KB) { tv.pop(); tf.pop(); } }
         const avl = Asum[pos];
